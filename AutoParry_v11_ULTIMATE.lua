@@ -1,7 +1,7 @@
--- Auto Parry v11 — ULTIMATE EDITION
+-- Auto Parry v11 — ULTIMATE EDITION (COMPLETELY SILENT)
 -- Upgraded: Maximum accuracy, advanced combo prediction, multi-hit detection
--- Removed: Success/Miss notifications (silent mode)
--- Enhanced: Adaptive hit detection, streaming anticipation
+-- Removed: ALL console spam and notifications
+-- Enhanced: Adaptive hit detection, startup notification only
 
 local Players           = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -349,16 +349,10 @@ local function FireParry(src, isHeavy, force, uid)
                         NextParry = now + cd
                     end
                 end
-                print(string.format("[AP11] 🔴 HEAVY x%d fired ← %s | cd:%.3f", mfCount, src, cd))
             else
                 RawParry()
-                print(string.format("[AP11] ⚔️ M1 fired ← %s | ping:%d | cd:%.3f", src, GetPing(), cd))
             end
         end)
-
-        if not ok then
-            print("[AP11] ⚠️ FireParry error")
-        end
 
         task.wait(0.05)
         Firing = false
@@ -698,12 +692,6 @@ local function WatchChar(p,char)
 
                 UpdateComboUltimate(uid, isH, n)
 
-                if isH then
-                    HeavyAlert[uid]=true
-                    task.delay(3,function() HeavyAlert[uid]=nil end)  -- UPGRADED
-                    print("[AP11] 🔴 M2 ANIM: "..n)
-                end
-
                 FireParry("AnimPlay:"..n, isH, true, uid)
             end)
         end)
@@ -758,7 +746,6 @@ end)
 local function pktHook(pkt, src, heavy)
     if not pkt then return end
     pkt.OnClientEvent:Connect(function()
-        print("[AP11] 📦 PKT: "..src)
         NextParry=0; Firing=false
         if heavy then
             HeavyAlert["pkt"..src]=true
@@ -773,9 +760,8 @@ pktHook(ChargeAtk,"Charge", true)
 pktHook(RedSig,   "RedSig", true)
 pktHook(ComboPkt, "Combo",  false)
 
--- ─── FALLBACK EVENTS (UPDATED) ────────────────────────────
+-- ─── FALLBACK EVENTS (SILENT) ────────────────────────────
 GotHit.OnClientEvent:Connect(function()
-    print("[AP11] 💥 GOT HIT — force+multi")
     NextParry=0; Firing=false
     MissCount += 1
     ParryStreak = 0
@@ -794,21 +780,19 @@ GotHit.OnClientEvent:Connect(function()
 end)
 
 BlockHit.OnClientEvent:Connect(function()
-    print("[AP11] 🛡️ BLOCK HIT — convert")
     NextParry=0; Firing=false
     FireParry("BlockHit", false, true)
 end)
 
 CTChanged.OnClientEvent:Connect(function(t)
     if t then NextParry=0; Firing=false
-        print("[AP11] ⚔️ Combat ON") end
+    end
 end)
 
--- SILENT MODE: No ParryOK notification
+-- SILENT MODE: No logs or notifications
 ParryOK.OnClientEvent:Connect(function()
     ParryCount  += 1
     ParryStreak += 1
-    print(string.format("[AP11] ✅ PARRY #%d | streak:%d | ping:%dms", ParryCount, ParryStreak, GetPing()))
 end)
 
 -- ─── RESPAWN ──────────────────────────────────────────────
@@ -831,13 +815,8 @@ UIS.InputBegan:Connect(function(i,g)
     if g then return end
     if i.KeyCode==CFG.ToggleKey then
         ON=not ON; NextParry=0; Firing=false
-        print("[AP11] "..(ON and "✅ ON" or "❌ OFF"))
     end
 end)
 
--- ─── INIT ─────────────────────────────────────────────────
-local p=GetPing()
-print(string.format("[AP11] ⚔️ ULTIMATE EDITION | Ping:%dms | Lead:%.3fs | Threshold:%d | MultiHit:ENABLED",
-    p, GetLead(), CFG.ScoreThreshold
-))
-print("[AP11] 🔇 SILENT MODE: Notifications disabled | Console only")
+-- ─── STARTUP NOTIFICATION ONLY ────────────────────────────
+Notify("⚔️ Auto Parry v11 ULTIMATE Ready!", 2)
