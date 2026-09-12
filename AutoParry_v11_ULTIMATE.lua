@@ -1,6 +1,6 @@
--- Auto Parry v12.1 — GODMODE + PING FIX
--- Patch: aggressive ping compensation, dynamic tap window, cooldown inversion
--- Silent mode
+-- Auto Parry v13.0 — ULTRA INSTINCT
+-- Chief Edition: Combo Burst + M2 Instant + Clean Log
+-- Delta Executor
 
 local Players           = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -19,16 +19,16 @@ local ok, Packets = pcall(function()
                                :WaitForChild("Shared",5)
     return require(S:WaitForChild("Packets",5))
 end)
-if not ok then warn("[AP12.1] Packets failed"); return end
+if not ok then return end
 
-local DSR       = Packets.DefenseStateRequest
-local CTChanged = Packets.CombatTagChanged
-local ParryOK   = Packets.ParrySuccess
-local BlockHit  = Packets.BlockHitReaction
-local GotHit    = Packets.GotHitScreenEffect
+local DSR      = Packets.DefenseStateRequest
+local CTChange = Packets.CombatTagChanged
+local ParryOK  = Packets.ParrySuccess
+local BlockHit = Packets.BlockHitReaction
+local GotHit   = Packets.GotHitScreenEffect
 
-local function tryPkt(name)
-    local s,v = pcall(function() return Packets[name] end)
+local function tryPkt(n)
+    local s,v = pcall(function() return Packets[n] end)
     return (s and v) or nil
 end
 local HeavyAtk  = tryPkt("HeavyAttack")
@@ -39,97 +39,95 @@ local ComboPkt  = tryPkt("ComboAttack")
 
 -- ─── CONFIG ───────────────────────────────────────────────
 local CFG = {
-    Range              = 20,
-    TapWindow          = 0.038,
-    CooldownM1         = 0.28,
-    CooldownM2         = 0.20,
-    ScoreThreshold     = 18,
-    ToggleKey          = Enum.KeyCode.RightShift,
+    Range             = 22,
+    TapWindow         = 0.032,      -- lebih ketat
+    CooldownM1        = 0.22,       -- lebih cepet dari v12
+    CooldownM2        = 0.15,       -- M2 ultra cepet
+    ToggleKey         = Enum.KeyCode.RightShift,
 
-    PreFireThreshold   = 0.08,    -- v12.1: lebih lebar
+    -- COMBO BURST (fitur baru)
+    BurstEnabled      = true,
+    BurstTrigger      = 2,          -- setelah 2 hit = burst mode
+    BurstFireCount    = 5,          -- fire 5x beruntun
+    BurstFireDelay    = 0.045,      -- jeda antar burst fire
+    BurstCooldown     = 0.12,       -- cooldown saat burst
 
-    MultiFireEnabled   = true,
-    MultiFireBase      = 3,
-    MultiFireMax       = 6,
-    MultiFireDelay     = 0.07,    -- v12.1: lebih ketat
+    -- M2 INSTANT
+    M2InstantEnabled  = true,
+    M2PreCount        = 4,          -- fire 4x untuk M2
+    M2PreDelay        = 0.05,
 
-    ChainWindow        = 1.0,
-    ForceAll           = true,
+    -- PING
+    PingCompEnabled   = true,
+    PingCompMax       = 0.70,
 
-    PingCompEnabled    = true,
-    PingCompMax        = 0.65,    -- v12.1: naik dari 0.45
+    -- MULTI FIRE
+    MultiFireEnabled  = true,
+    MultiFireBase     = 3,
+    MultiFireMax      = 7,
+    MultiFireDelay    = 0.055,
 
-    AdaptiveCooldown   = true,
-    AnglePredict       = true,
-    VelSharpening      = true,
-    AnimCacheStrict    = true,
-    MaxQueueTargets    = 5,
+    -- ADAPTIVE
+    AdaptiveCooldown  = true,
+    ScoreThreshold    = 15,
+    ThresholdFloor    = 10,
+    MissDecay         = 2,
 
-    FiringTimeout      = 0.8,
-    SelfGuard          = true,
-    ToolSelfGuard      = true,
-
-    PreAnimDetect      = true,
-    VelPreFire         = true,
-    VelPreFireThresh   = 8,
-
-    ComboLockEnabled   = true,
-    ComboLockWindow    = 0.22,
-    ComboLockMax       = 8,
-
-    M2PreFireEnabled   = true,
-    M2PreFireExtra     = 2,
-
-    AdaptiveThreshold  = true,
-    ThresholdFloor     = 12,
-    MissDecay          = 2,
-
-    HeartbeatDebounce  = 0.02,
-    HistoryDepth       = 20,
+    -- MISC
+    Range             = 22,
+    HeartbeatDebounce = 0.015,      -- lebih sering scan
+    FiringTimeout     = 0.6,
+    HistoryDepth      = 24,
+    ChainWindow       = 1.2,
+    MaxQueueTargets   = 6,
+    PreFireThreshold  = 0.06,
+    VelPreFire        = true,
+    VelPreFireThresh  = 7,
+    AnglePredict      = true,
+    VelSharpening     = true,
+    SelfGuard         = true,
+    ForceAll          = true,
+    ComboLockEnabled  = true,
+    ComboLockWindow   = 0.18,       -- lebih ketat
+    ComboLockMax      = 10,
 }
 
 -- ─── STATE ────────────────────────────────────────────────
-local ON             = true
-local NextParry      = 0
-local Firing         = false
-local FiringAt       = 0
-local ParryCount     = 0
-local MissCount      = 0
-local ConsecMiss     = 0
-local DynThreshold   = CFG.ScoreThreshold
-local Watched        = {}
-local PrevVel        = {}
-local PrevAnims      = {}
-local HeavyAlert     = {}
-local ComboTracker   = {}
-local LastHitTime    = {}
-local HitHistory     = {}
-local LastAnimFire   = {}
-local LastHeartbeat  = 0
-local ComboLockActive  = {}
-local ComboLockUntil   = {}
-local ComboLockCount   = {}
-local LastVelSpike     = {}
-local M2Detected       = {}
-local AttackTypeSeq    = {}
+local ON            = true
+local NextParry     = 0
+local Firing        = false
+local FiringAt      = 0
+local ParryCount    = 0
+local MissCount     = 0
+local ConsecMiss    = 0
+local DynThreshold  = CFG.ScoreThreshold
+local Watched       = {}
+local PrevVel       = {}
+local HeavyAlert    = {}
+local ComboTracker  = {}
+local LastHitTime   = {}
+local HitHistory    = {}
+local LastAnimFire  = {}
+local LastHeartbeat = 0
+local ComboLockActive = {}
+local ComboLockUntil  = {}
+local ComboLockCount  = {}
+local LastVelSpike    = {}
+local M2Detected      = {}
+local BurstActive     = {}  -- NEW: burst mode per enemy
+local BurstUntil      = {}  -- NEW: burst expiry
 
--- ─── SELF ATTACK ATTRS ────────────────────────────────────
-local SELF_ATKS = {
-    "State_Attacking","IsAttacking","Attacking","SwingActive",
-    "M1","Swinging","InAttack","AttackState","HitActive","StrikeActive",
-}
-
--- ─── PING (v12.1 PATCH) ───────────────────────────────────
+-- ─── PING ─────────────────────────────────────────────────
 local PingCache     = 80
 local PingLastCheck = 0
 
 local function GetPing()
     local now = os.clock()
-    if now - PingLastCheck > 0.3 then
-        local ok2,v = pcall(function()
+    if now - PingLastCheck > 0.25 then
+        local s,v = pcall(function()
             return Stats.Network.ServerStatsItem["Data Ping"]:GetValue()
         end)
-        PingCache     = (ok2 and v) or PingCache
+        PingCache     = (s and v) or PingCache
         PingLastCheck = now
     end
     return PingCache
@@ -137,12 +135,7 @@ end
 
 local function GetLead()
     if not CFG.PingCompEnabled then return 0 end
-    local ping = GetPing()
-    -- ping 80  → ~0.18s
-    -- ping 150 → ~0.33s
-    -- ping 250 → ~0.55s
-    -- ping 400 → 0.65s (cap)
-    local raw = (ping / 1000) * 3.2
+    local raw = (GetPing() / 1000) * 3.2
     return math.min(CFG.PingCompMax, raw)
 end
 
@@ -150,15 +143,10 @@ local function GetCooldown(isHeavy)
     local base = isHeavy and CFG.CooldownM2 or CFG.CooldownM1
     if not CFG.AdaptiveCooldown then return base end
     local ping = GetPing()
-    -- v12.1 PATCH: ping tinggi = cooldown LEBIH PENDEK
-    -- kebalikan dari sebelumnya, biar bisa re-fire lebih sering
     if ping > 150 then
-        local reduction = math.min(0.08, (ping - 150) / 2000)
-        return math.max(base * 0.60, base - reduction)
+        return math.max(base * 0.55, base - math.min(0.09,(ping-150)/1800))
     end
-    -- ping normal: sedikit naikin cooldown biar stabil
-    local factor = 1 + ((ping - 80) / 1200)
-    return math.max(base * 0.75, math.min(base * 1.15, base * factor))
+    return math.max(base * 0.70, base * (1 + (ping-80)/1200))
 end
 
 -- ─── HELPERS ──────────────────────────────────────────────
@@ -177,31 +165,30 @@ end
 
 local function Notify(t,d)
     pcall(game.StarterGui.SetCore, game.StarterGui,
-        "SendNotification",{Title="⚔️ AP v12.1",Text=t,Duration=d or 2})
+        "SendNotification",{Title="⚔️ AP v13",Text=t,Duration=d or 2})
 end
 
 -- ─── SELF GUARD ───────────────────────────────────────────
+local SELF_ATKS = {
+    "State_Attacking","IsAttacking","Attacking","SwingActive",
+    "M1","Swinging","InAttack","AttackState","HitActive","StrikeActive",
+}
+
 local function IsSelfAttacking()
-    if not CFG.SelfGuard then return false end
-    if not Char then return false end
+    if not CFG.SelfGuard or not Char then return false end
     for _,a in ipairs(SELF_ATKS) do
-        local v = Char:GetAttribute(a)
-        if v == true then return true end
-        if Hum then
-            v = Hum:GetAttribute(a)
-            if v == true then return true end
-        end
+        if Char:GetAttribute(a)==true then return true end
+        if Hum and Hum:GetAttribute(a)==true then return true end
     end
     return false
 end
 
--- ─── DYNAMIC THRESHOLD ────────────────────────────────────
+-- ─── ADAPTIVE THRESHOLD ───────────────────────────────────
 local function UpdateThreshold(missed)
-    if not CFG.AdaptiveThreshold then return end
     if missed then
         ConsecMiss   += 1
         DynThreshold  = math.max(CFG.ThresholdFloor,
-            DynThreshold - CFG.MissDecay * math.min(ConsecMiss, 3))
+            DynThreshold - CFG.MissDecay * math.min(ConsecMiss, 4))
     else
         ConsecMiss    = 0
         DynThreshold  = math.min(CFG.ScoreThreshold, DynThreshold + 1)
@@ -212,19 +199,12 @@ end
 local function CanFire(force)
     if not ON then return false end
     if Firing then
-        if os.clock() - FiringAt > CFG.FiringTimeout then
-            Firing = false
-        else
-            return false
-        end
+        if os.clock() - FiringAt > CFG.FiringTimeout then Firing = false
+        else return false end
     end
     if os.clock() < NextParry then return false end
     if not Refresh() then return false end
     if IsSelfAttacking() then return false end
-    if not force and not CFG.ForceAll then
-        if Char:GetAttribute("State_Ragdolled") then return false end
-        if Char:GetAttribute("State_Safe") then return false end
-    end
     return true
 end
 
@@ -232,7 +212,7 @@ end
 local function RecordHit(uid, isHeavy, src)
     local now = os.clock()
     if not HitHistory[uid] then HitHistory[uid] = {} end
-    table.insert(HitHistory[uid], {t=now, h=isHeavy, s=src})
+    table.insert(HitHistory[uid], {t=now,h=isHeavy,s=src})
     if #HitHistory[uid] > CFG.HistoryDepth then
         table.remove(HitHistory[uid], 1)
     end
@@ -243,11 +223,24 @@ local function GetAvgInterval(uid)
     local h = HitHistory[uid]
     if not h or #h < 3 then return nil end
     local sum, n = 0, 0
-    for i = 2, #h do
-        sum += h[i].t - h[i-1].t
-        n   += 1
-    end
+    for i = 2, #h do sum += h[i].t - h[i-1].t; n += 1 end
     return n > 0 and (sum/n) or nil
+end
+
+-- ─── BURST MODE (NEW v13) ─────────────────────────────────
+local function ActivateBurst(uid)
+    if not CFG.BurstEnabled then return end
+    BurstActive[uid] = true
+    BurstUntil[uid]  = os.clock() + (CFG.BurstFireCount * CFG.BurstFireDelay) + 0.3
+end
+
+local function IsBurst(uid)
+    if not BurstActive[uid] then return false end
+    if os.clock() > BurstUntil[uid] then
+        BurstActive[uid] = false
+        return false
+    end
+    return true
 end
 
 -- ─── COMBO LOCK ───────────────────────────────────────────
@@ -269,7 +262,6 @@ local function TickComboLock(uid)
             return true
         else
             ComboLockActive[uid] = false
-            ComboLockCount[uid]  = 0
             return false
         end
     end
@@ -284,13 +276,20 @@ local function UpdateCombo(uid, isHeavy, src)
     if now - last > CFG.ChainWindow then
         ComboTracker[uid]    = 0
         ComboLockActive[uid] = false
+        BurstActive[uid]     = false
     end
     RecordHit(uid, isHeavy, src)
     ComboTracker[uid] += 1
+
+    -- Trigger burst saat combo >= BurstTrigger
+    if ComboTracker[uid] >= CFG.BurstTrigger then
+        ActivateBurst(uid)
+    end
+
     if ComboTracker[uid] >= 2 then
         local avg = GetAvgInterval(uid)
         if avg and avg < 0.6 then
-            ActivateComboLock(uid, math.min(ComboTracker[uid] + 2, CFG.ComboLockMax))
+            ActivateComboLock(uid, math.min(ComboTracker[uid] + 3, CFG.ComboLockMax))
         end
     end
     return ComboTracker[uid]
@@ -300,7 +299,7 @@ local function GetMultiFire(uid, isHeavy)
     if not CFG.MultiFireEnabled then return 1 end
     local combo = ComboTracker[uid] or 0
     local base  = CFG.MultiFireBase
-    if isHeavy then base = base + CFG.M2PreFireExtra end
+    if isHeavy then base = base + CFG.M2PreCount end
     if combo >= 5 then base = CFG.MultiFireMax
     elseif combo >= 3 then base = base + 2
     elseif combo >= 1 then base = base + 1 end
@@ -308,77 +307,68 @@ local function GetMultiFire(uid, isHeavy)
     if avg and avg < 0.25 then
         base = math.min(CFG.MultiFireMax, base + 1)
     end
-    -- v12.1: ping tinggi = multi fire lebih banyak untuk kompensasi
     local ping = GetPing()
-    if ping > 150 then
-        base = math.min(CFG.MultiFireMax, base + 1)
-    end
-    if ping > 250 then
-        base = math.min(CFG.MultiFireMax, base + 1)
-    end
+    if ping > 150 then base = math.min(CFG.MultiFireMax, base + 1) end
+    if ping > 250 then base = math.min(CFG.MultiFireMax, base + 1) end
+    if IsBurst(uid) then base = CFG.MultiFireMax end -- burst = max fire
     return math.min(CFG.MultiFireMax, base)
 end
 
--- ─── CORE PARRY (v12.1 PATCH) ─────────────────────────────
+-- ─── CORE PARRY ───────────────────────────────────────────
 local function RawParry()
     pcall(function()
         local ping = GetPing()
-        if CFG.ForceAll then
-            pcall(function() DSR:Fire("EndRagdoll")   end)
-            pcall(function() DSR:Fire("EndKnockback") end)
-            -- CancelAction TIDAK dipanggil — ini yang bikin bug
-        end
-        -- v12.1: TapWindow dinamis
-        -- ping tinggi = tap lebih pendek biar parry nyampe server tepat waktu
         local dynTap = ping > 150
-            and math.max(0.022, CFG.TapWindow - (ping - 150) / 8000)
+            and math.max(0.018, CFG.TapWindow - (ping-150)/9000)
             or  CFG.TapWindow
-
-        task.wait(0.008)
+        task.wait(0.006)
         DSR:Fire("BeginBlock")
         task.wait(dynTap)
         DSR:Fire("BeginParry")
-        task.wait(0.026)   -- v12.1: dipercepat dari 0.032
+        task.wait(0.020)
         DSR:Fire("EndBlock")
     end)
 end
 
-local function FireParry(src, isHeavy, force, uid)
+local function FireParry(isHeavy, force, uid)
     if not CanFire(force) then return false end
     local cd      = GetCooldown(isHeavy)
     Firing        = true
     FiringAt      = os.clock()
-    NextParry     = os.clock() + cd
+
+    -- Burst mode: CD lebih pendek
+    NextParry = os.clock() + (IsBurst(uid) and CFG.BurstCooldown or cd)
+
     local lead    = GetLead()
     local mfCount = GetMultiFire(uid, isHeavy)
 
     task.spawn(function()
         pcall(function()
             if lead > 0.005 then task.wait(lead) end
-            if isHeavy and CFG.MultiFireEnabled then
-                for i = 1, mfCount do
-                    if IsSelfAttacking() then break end
-                    RawParry()
-                    if i < mfCount then
-                        task.wait(CFG.MultiFireDelay)
-                    end
+            for i = 1, mfCount do
+                if IsSelfAttacking() then break end
+                RawParry()
+                if i < mfCount then
+                    task.wait(IsBurst(uid) and CFG.BurstFireDelay or CFG.MultiFireDelay)
                 end
-            else
-                if not IsSelfAttacking() then RawParry() end
             end
         end)
-        task.wait(0.04)
+        task.wait(0.035)
         Firing = false
     end)
     return true
 end
 
--- v12: M2 immediate bypass
-local function FireM2Immediate(uid)
-    if not CFG.M2PreFireEnabled then return end
-    if Firing and os.clock() - FiringAt > 0.1 then Firing = false end
+local function FireM2Instant(uid)
+    if not CFG.M2InstantEnabled then return end
+    if Firing and os.clock() - FiringAt > 0.08 then Firing = false end
     NextParry = 0
-    FireParry("M2Imm", true, true, uid)
+    task.spawn(function()
+        for i = 1, CFG.M2PreCount do
+            RawParry()
+            task.wait(CFG.M2PreDelay)
+        end
+    end)
 end
 
 -- ─── ANIM KEYWORDS ────────────────────────────────────────
@@ -386,14 +376,14 @@ local M2_KW = {
     "m2","heavy","charge","charged","block_break","smash","slam",
     "uppercut","overhead","power","special","red","danger",
     "unblockable","fury","burst","rage","break","grab","throw",
-    "launch","spin","twirl","windmill","finisher","execute",
-    "stomp","ground","aoe","explosion","super","ultra","final",
+    "launch","spin","finisher","execute","stomp","ground",
+    "aoe","super","ultra","final","critical",
 }
 local M1_KW = {
     "m1","m3","m4","m5","attack","atk","swing","swipe","slash",
-    "punch","hit","combo","strike","jab","smash","lunge","thrust",
+    "punch","hit","combo","strike","jab","lunge","thrust",
     "kick","light","fast","quick","right","left","normal","basic",
-    "wind","combat","fight","claw","stab","cut","slice","chop",
+    "combat","fight","claw","stab","cut","slice","chop",
 }
 
 local function IsM2Anim(n)
@@ -407,7 +397,7 @@ local function IsM1Anim(n)
     return false
 end
 
--- ─── ATTR KEYWORDS ────────────────────────────────────────
+-- ─── ATTR LISTS ───────────────────────────────────────────
 local M2_ATTR = {
     "State_HeavyAttack","State_M2","HeavyAttacking","M2",
     "IsHeavy","ChargingAttack","PowerAttack","BlockBreak",
@@ -417,9 +407,8 @@ local M2_ATTR = {
 local ALL_ATTR = {
     "State_Attacking","State_AttackAnimation","State_Combat",
     "Attacking","AttackAnimation","IsAttacking","IsSwinging",
-    "Combat_Attacking","M1","Swinging","Punching","Hitting",
-    "InAttack","Action_Attack","AttackState","Fighting",
-    "IsInCombat","SwingActive","HitActive","StrikeActive",
+    "M1","Swinging","Punching","Hitting","InAttack","AttackState",
+    "Fighting","SwingActive","HitActive","StrikeActive",
     "State_HeavyAttack","State_M2","HeavyAttacking","M2",
     "IsHeavy","ChargingAttack","PowerAttack","BlockBreak",
     "IsUnblockable","RedAttack","SpecialAttack","FuryAttack",
@@ -446,23 +435,22 @@ local function ScanAttrs(char,eh)
     return false,false,nil
 end
 
--- ─── ANGLE PREDICTOR ──────────────────────────────────────
-local function GetSwingArcBonus(er)
+-- ─── ANGLE + VEL BONUS ────────────────────────────────────
+local function GetSwingBonus(er)
     if not CFG.AnglePredict or not Root or not er then return 0 end
-    local toMe   = (Root.Position - er.Position)
-    local dist   = toMe.Magnitude
-    if dist < 0.1 then return 0 end
-    local dirN    = toMe / dist
+    local toMe = (Root.Position - er.Position)
+    local d    = toMe.Magnitude
+    if d < 0.1 then return 0 end
+    local dirN    = toMe / d
     local faceDot = er.CFrame.LookVector:Dot(dirN)
     local sideDot = math.abs(er.CFrame.RightVector:Dot(dirN))
-    local bonus = 0
+    local bonus   = 0
     if faceDot > 0.5  then bonus += 14 end
     if sideDot > 0.4  then bonus += 10 end
     if faceDot > 0.78 then bonus += 8  end
     return bonus
 end
 
--- ─── VELOCITY BONUS ───────────────────────────────────────
 local function GetVelBonus(uid, er)
     if not CFG.VelSharpening or not Root or not er then return 0 end
     local vel  = er.Velocity
@@ -474,10 +462,10 @@ local function GetVelBonus(uid, er)
     if toMe.Magnitude < 0.1 then return 0 end
     local dirN = toMe.Unit
     if vel.Magnitude < 0.1 then return 0 end
-    local approachDot = dirN:Dot(vel.Unit)
+    local dot = dirN:Dot(vel.Unit)
     local bonus = 0
-    if approachDot > 0.25 then bonus += math.floor(approachDot * 30) end
-    if math.abs(vel.Unit.Y) > 0.35 and approachDot > 0.1 then bonus += 12 end
+    if dot > 0.25 then bonus += math.floor(dot * 30) end
+    if math.abs(vel.Unit.Y) > 0.35 and dot > 0.1 then bonus += 12 end
     return math.min(bonus, 42)
 end
 
@@ -488,15 +476,13 @@ local function CheckVelPreFire(uid, er)
     local acc  = (vel - prev).Magnitude
     if acc >= CFG.VelPreFireThresh then
         local toMe = (Root.Position - er.Position)
-        if toMe.Magnitude < 0.1 then return end
-        if vel.Magnitude < 0.1 then return end
+        if toMe.Magnitude < 0.1 or vel.Magnitude < 0.1 then return end
         local dot = toMe.Unit:Dot(vel.Unit)
         if dot > 0.3 then
             local now  = os.clock()
-            local last = LastVelSpike[uid] or 0
-            if now - last > 0.13 then
+            if now - (LastVelSpike[uid] or 0) > 0.11 then
                 LastVelSpike[uid] = now
-                FireParry("VelSpike", false, true, uid)
+                FireParry(false, true, uid)
             end
         end
     end
@@ -505,25 +491,21 @@ end
 -- ─── SCORE ENGINE ─────────────────────────────────────────
 local function Score(p)
     local ec = p.Character
-    if not ec then return 0,false,"" end
+    if not ec then return 0,false end
     local er = ec:FindFirstChild("HumanoidRootPart")
     local eh = ec:FindFirstChildWhichIsA("Humanoid")
-    if not er or not eh or eh.Health<=0 then return 0,false,"" end
-    if not Root then return 0,false,"" end
+    if not er or not eh or eh.Health<=0 or not Root then return 0,false end
     local d = Dist(Root,er)
-    if d > CFG.Range then return 0,false,"" end
+    if d > CFG.Range then return 0,false end
 
-    local sc=0; local hvy=false; local rsn=""
+    local sc=0; local hvy=false
     local uid = p.UserId
 
     sc += math.floor((1 - d/CFG.Range) * 15)
 
-    local hasAttr,isHAttr,attrN = ScanAttrs(ec,eh)
-    if isHAttr then
-        sc+=80; hvy=true; rsn="HvyAttr:"..attrN
-    elseif hasAttr then
-        sc+=50; rsn="Attr:"..tostring(attrN)
-    end
+    local hasAttr,isHAttr,_ = ScanAttrs(ec,eh)
+    if isHAttr      then sc+=80; hvy=true
+    elseif hasAttr  then sc+=50 end
 
     local anim = eh:FindFirstChildOfClass("Animator")
     if anim then
@@ -534,14 +516,14 @@ local function Score(p)
                     local n=t.Animation.Name; local pos=t.TimePosition
                     if IsM2Anim(n) then
                         hvy=true
-                        if pos<=CFG.PreFireThreshold then sc+=75;rsn="M2E:"..n
-                        elseif pos<0.25 then sc+=60;rsn="M2M:"..n
-                        else sc+=35;rsn="M2L:"..n end
+                        if pos<=CFG.PreFireThreshold then sc+=75
+                        elseif pos<0.25 then sc+=60
+                        else sc+=35 end
                         break
                     elseif IsM1Anim(n) then
-                        if pos<=CFG.PreFireThreshold then sc+=65;rsn="M1E:"..n
-                        elseif pos<0.18 then sc+=50;rsn="M1M:"..n
-                        else sc+=22;rsn="M1L:"..n end
+                        if pos<=CFG.PreFireThreshold then sc+=65
+                        elseif pos<0.18 then sc+=50
+                        else sc+=22 end
                         break
                     end
                 end
@@ -552,17 +534,16 @@ local function Score(p)
     if HeavyAlert[uid] then sc+=30; hvy=true end
 
     local combo = ComboTracker[uid] or 0
-    if combo > 0 then
-        sc += math.min(combo * 12, 50)
-        rsn = rsn=="" and ("Combo:"..combo) or rsn
-    end
+    if combo > 0 then sc += math.min(combo*12, 60) end
+
+    if IsBurst(uid) then sc += 40 end -- burst = score boost
 
     local avg = GetAvgInterval(uid)
     if avg and avg < 0.4 then
-        sc += math.floor((1 - avg/0.4) * 20)
+        sc += math.floor((1-avg/0.4)*20)
     end
 
-    sc += GetSwingArcBonus(er)
+    sc += GetSwingBonus(er)
     sc += GetVelBonus(uid, er)
 
     if d < 8 then
@@ -570,7 +551,7 @@ local function Score(p)
         if toMe:Dot(er.CFrame.LookVector) > 0.62 then sc+=15 end
     end
 
-    return math.min(sc,130), hvy, rsn~="" and rsn or "Multi"
+    return math.min(sc,140), hvy
 end
 
 -- ─── PRIORITY QUEUE ───────────────────────────────────────
@@ -578,9 +559,9 @@ local function BuildQueue()
     local q={}
     for _,p in pairs(Players:GetPlayers()) do
         if p~=LP then
-            local sc,hv,r=Score(p)
+            local sc,hv=Score(p)
             if sc>=DynThreshold then
-                table.insert(q,{player=p,score=sc,heavy=hv,reason=r})
+                table.insert(q,{player=p,score=sc,heavy=hv})
             end
         end
     end
@@ -593,20 +574,23 @@ end
 RunService.Heartbeat:Connect(function()
     if not ON or not Refresh() then return end
     if IsSelfAttacking() then return end
-
     local now = os.clock()
     if now - LastHeartbeat < CFG.HeartbeatDebounce then return end
     LastHeartbeat = now
 
     for _,p in pairs(Players:GetPlayers()) do
-        if p ~= LP and p.Character then
+        if p~=LP and p.Character then
             local er = p.Character:FindFirstChild("HumanoidRootPart")
-            if er and Root and Dist(Root,er) <= CFG.Range then
+            if er and Root and Dist(Root,er)<=CFG.Range then
                 local uid = p.UserId
                 if ComboLockActive[uid] and TickComboLock(uid) then
                     if now >= NextParry then
-                        FireParry("ComboLock", false, true, uid)
+                        FireParry(false, true, uid)
                     end
+                end
+                -- Burst mode: fire terus selama burst aktif
+                if IsBurst(uid) and now >= NextParry then
+                    FireParry(false, true, uid)
                 end
                 CheckVelPreFire(uid, er)
             end
@@ -614,119 +598,107 @@ RunService.Heartbeat:Connect(function()
     end
 
     if now < NextParry then return end
-
     local q = BuildQueue()
     if #q > 0 then
         local top = q[1]
         local uid = top.player.UserId
         if top.heavy then
-            HeavyAlert[uid]=true
-            task.delay(3,function() HeavyAlert[uid]=nil end)
+            HeavyAlert[uid] = true
+            task.delay(3, function() HeavyAlert[uid]=nil end)
         end
-        local fired = FireParry(
-            string.format("[%d]%s/%s",top.score,top.reason,top.player.Name),
-            top.heavy,true,uid
-        )
-        if fired then UpdateThreshold(false) end
+        local fired = FireParry(top.heavy, true, uid)
+        if fired then
+            UpdateCombo(uid, top.heavy, "HB")
+            UpdateThreshold(false)
+        end
     end
 end)
 
 -- ─── REALTIME WATCHERS ────────────────────────────────────
-local function WatchChar(p,char)
+local function WatchChar(p, char)
     if not char then return end
     local er  = char:FindFirstChild("HumanoidRootPart")
     local eh  = char:FindFirstChildWhichIsA("Humanoid")
     local uid = p.UserId
 
-    local function watchA(obj,attr)
+    local function watchA(obj, attr)
         pcall(function()
             obj:GetAttributeChangedSignal(attr):Connect(function()
                 if not ON then return end
-                if os.clock()<NextParry then return end
                 if IsSelfAttacking() then return end
-                local v=obj:GetAttribute(attr)
+                local v = obj:GetAttribute(attr)
                 if not(v==true or(type(v)=="string" and
                     (v:lower():find("attack") or v:lower():find("heavy")))) then return end
                 if not er or not Root then return end
-                if Dist(Root,er)>CFG.Range then return end
-                local isHvy=IsHeavyAttr(attr)
+                if Dist(Root,er) > CFG.Range then return end
+                local isHvy = IsHeavyAttr(attr)
                 if isHvy then
-                    HeavyAlert[uid]=true
+                    HeavyAlert[uid] = true
                     task.delay(3,function() HeavyAlert[uid]=nil end)
                     if not M2Detected[uid] then
-                        M2Detected[uid]=true
+                        M2Detected[uid] = true
                         task.delay(2,function() M2Detected[uid]=nil end)
-                        FireM2Immediate(uid)
+                        FireM2Instant(uid)
                         return
                     end
                 end
-                FireParry("WAttr:"..attr,isHvy,true,uid)
+                UpdateCombo(uid, isHvy, attr)
+                FireParry(isHvy, true, uid)
             end)
         end)
     end
 
     for _,a in ipairs(ALL_ATTR) do
-        watchA(char,a)
-        if eh then watchA(eh,a) end
+        watchA(char, a)
+        if eh then watchA(eh, a) end
     end
 
     local function watchAnim(animator)
         pcall(function()
             animator.AnimationPlayed:Connect(function(track)
-                if not ON then return end
-                if not track then return end
+                if not ON or not track then return end
                 if IsSelfAttacking() then return end
-                local ok2,n=pcall(function() return track.Animation.Name end)
+                local ok2,n = pcall(function() return track.Animation.Name end)
                 if not ok2 or not n then return end
-                local isH=IsM2Anim(n); local isM=IsM1Anim(n)
+                local isH = IsM2Anim(n)
+                local isM = IsM1Anim(n)
                 if not isH and not isM then return end
                 if not er or not Root then return end
-                if Dist(Root,er)>CFG.Range then return end
-
-                local now=os.clock()
-                local cacheK=string.format("%d_%s",uid,n)
-                local lastFire=LastAnimFire[cacheK] or 0
-                if now-lastFire < 0.22 then return end
-                LastAnimFire[cacheK]=now
-
-                UpdateCombo(uid,isH,n)
-
+                if Dist(Root,er) > CFG.Range then return end
+                local now = os.clock()
+                local cacheK = string.format("%d_%s",uid,n)
+                if now-(LastAnimFire[cacheK] or 0) < 0.18 then return end
+                LastAnimFire[cacheK] = now
+                UpdateCombo(uid, isH, n)
                 if isH then
-                    HeavyAlert[uid]=true
+                    HeavyAlert[uid] = true
                     task.delay(3,function() HeavyAlert[uid]=nil end)
-                    FireM2Immediate(uid)
+                    FireM2Instant(uid)
                 else
-                    FireParry("AnimPlay:"..n,false,true,uid)
+                    FireParry(false, true, uid)
                 end
             end)
         end)
     end
 
     if eh then
-        local an=eh:FindFirstChildOfClass("Animator")
+        local an = eh:FindFirstChildOfClass("Animator")
         if an then watchAnim(an)
         else eh.ChildAdded:Connect(function(c)
             if c:IsA("Animator") then watchAnim(c) end
         end) end
     end
-
-    char.ChildAdded:Connect(function(c)
-        if not c:IsA("Tool") then return end
-        if CFG.ToolSelfGuard and char==LP.Character then return end
-        if not ON or not er or not Root then return end
-        if Dist(Root,er)>CFG.Range then return end
-        FireParry("ToolEq:"..c.Name,false,false,uid)
-    end)
 end
 
 local function Watch(p)
     if not p or p==LP then return end
     if Watched[p.UserId] then return end
-    Watched[p.UserId]=true
-    if p.Character then WatchChar(p,p.Character) end
+    Watched[p.UserId] = true
+    if p.Character then WatchChar(p, p.Character) end
     p.CharacterAdded:Connect(function(c)
-        Watched[p.UserId]=nil
-        task.wait(0.5); Watch(p)
+        Watched[p.UserId] = nil
+        task.wait(0.4)
+        Watch(p)
     end)
 end
 
@@ -737,77 +709,73 @@ end
 WatchAll()
 Players.PlayerAdded:Connect(function(p) task.wait(0.3); Watch(p) end)
 Players.PlayerRemoving:Connect(function(p)
-    local uid=p.UserId
+    local uid = p.UserId
     Watched[uid]=nil; PrevVel[uid]=nil; HeavyAlert[uid]=nil
     ComboTracker[uid]=nil; LastHitTime[uid]=nil; HitHistory[uid]=nil
-    AttackTypeSeq[uid]=nil; ComboLockActive[uid]=nil
+    LastAnimFire[uid]=nil; ComboLockActive[uid]=nil
     ComboLockCount[uid]=nil; M2Detected[uid]=nil
-    LastVelSpike[uid]=nil
+    LastVelSpike[uid]=nil; BurstActive[uid]=nil
 end)
 
 -- ─── OPTIONAL PACKETS ─────────────────────────────────────
-local function pktHook(pkt,src,heavy)
+local function pktHook(pkt,heavy)
     if not pkt then return end
     pkt.OnClientEvent:Connect(function()
         NextParry=0; Firing=false
-        if heavy then
-            HeavyAlert["pkt"..src]=true
-            task.delay(3,function() HeavyAlert["pkt"..src]=nil end)
-            FireM2Immediate(nil)
-        else
-            FireParry("Pkt:"..src,false,true)
-        end
+        if heavy then FireM2Instant(nil)
+        else FireParry(false, true) end
     end)
 end
-pktHook(M2Pkt,"M2",true)
-pktHook(HeavyAtk,"Heavy",true)
-pktHook(ChargeAtk,"Charge",true)
-pktHook(RedSig,"RedSig",true)
-pktHook(ComboPkt,"Combo",false)
+pktHook(M2Pkt, true)
+pktHook(HeavyAtk, true)
+pktHook(ChargeAtk, true)
+pktHook(RedSig, true)
+pktHook(ComboPkt, false)
 
 -- ─── FALLBACK EVENTS ──────────────────────────────────────
 GotHit.OnClientEvent:Connect(function()
     NextParry=0; Firing=false
-    MissCount+=1
+    MissCount += 1
     UpdateThreshold(true)
     if Root then
         for _,p in pairs(Players:GetPlayers()) do
             if p~=LP and p.Character then
-                local er=p.Character:FindFirstChild("HumanoidRootPart")
+                local er = p.Character:FindFirstChild("HumanoidRootPart")
                 if er and Dist(Root,er)<=CFG.Range then
-                    local uid=p.UserId
-                    UpdateCombo(uid,false,"GotHit")
+                    local uid = p.UserId
+                    UpdateCombo(uid, false, "GotHit")
                     ActivateComboLock(uid, CFG.ComboLockMax)
+                    ActivateBurst(uid)  -- kena hit = langsung burst
                 end
             end
         end
     end
-    FireParry("GotHit",false,true)
+    FireParry(false, true)
 end)
 
 BlockHit.OnClientEvent:Connect(function()
     NextParry=0; Firing=false
-    FireParry("BlockHit",false,true)
+    FireParry(false, true)
 end)
 
-CTChanged.OnClientEvent:Connect(function(t)
+CTChange.OnClientEvent:Connect(function(t)
     if t then NextParry=0; Firing=false end
 end)
 
 ParryOK.OnClientEvent:Connect(function()
-    ParryCount+=1
+    ParryCount += 1
 end)
 
 -- ─── RESPAWN ──────────────────────────────────────────────
 LP.CharacterAdded:Connect(function(c)
     Char=c; Hum=c:WaitForChild("Humanoid"); Root=c:WaitForChild("HumanoidRootPart")
     NextParry=0; Firing=false; FiringAt=0; LastHeartbeat=0
-    Watched={}; PrevAnims={}; HeavyAlert={}; ComboTracker={}
+    Watched={}; HeavyAlert={}; ComboTracker={}
     LastHitTime={}; HitHistory={}; LastAnimFire={}
     ComboLockActive={}; ComboLockCount={}; ComboLockUntil={}
-    M2Detected={}; LastVelSpike={}; AttackTypeSeq={}
-    DynThreshold=CFG.ScoreThreshold; ConsecMiss=0
-    task.wait(0.8); WatchAll()
+    M2Detected={}; LastVelSpike={}; BurstActive={}; BurstUntil={}
+    PrevVel={}; DynThreshold=CFG.ScoreThreshold; ConsecMiss=0
+    task.wait(0.7); WatchAll()
 end)
 
 -- ─── TOGGLE ───────────────────────────────────────────────
@@ -815,9 +783,9 @@ UIS.InputBegan:Connect(function(i,g)
     if g then return end
     if i.KeyCode==CFG.ToggleKey then
         ON=not ON; NextParry=0; Firing=false
-        Notify(ON and "✅ v12.1 ON" or "❌ v12.1 OFF")
+        Notify(ON and "✅ v13 ON" or "❌ v13 OFF")
     end
 end)
 
 -- ─── INIT ─────────────────────────────────────────────────
-Notify("⚔️ Auto Parry v12.1 GODMODE + PING FIX", 2)
+Notify("⚔️ Auto Parry v13.0 — ULTRA INSTINCT", 3)
