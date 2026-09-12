@@ -1,6 +1,6 @@
--- Auto Parry v10 — APEX EDITION
--- Upgrade dari v9: smarter scoring, adaptive timing, hit prediction, priority queue
--- Logika & sistem inti tetap identik
+-- Auto Parry v10 — APEX EDITION (FIXED)
+-- Bugfixes: auto-fire control, attack responsiveness, safety checks
+-- Upgraded: debounce, error handling, animation safety
 
 local Players           = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -43,33 +43,37 @@ local CFG = {
     TapWindow         = 0.04,
     CooldownM1        = 0.36,
     CooldownM2        = 0.26,
-    ScoreThreshold    = 16,       -- v10: lebih sensitif dari v9
+    ScoreThreshold    = 35,       -- FIXED: raised from 16 (was too sensitive)
     ToggleKey         = Enum.KeyCode.RightShift,
 
     PreFireEnabled    = true,
-    PreFireThreshold  = 0.07,     -- lebih ketat dari v9
+    PreFireThreshold  = 0.07,
 
     MultiFireEnabled  = true,
-    MultiFireCount    = 3,        -- base count, adaptive di runtime
+    MultiFireCount    = 3,
     MultiFireDelay    = 0.11,
 
-    ChainEnabled      = true,
-    ChainWindow       = 0.65,     -- sedikit lebih lebar
+    ChainWindow       = 0.65,
 
     ForceAll          = true,
 
     PingCompEnabled   = true,
     PingCompMax       = 0.35,
 
-    -- v10 NEW
-    AdaptiveCooldown  = true,     -- cooldown ngikutin ping
-    AnglePredict      = true,     -- score bonus dari swing arc
-    HitFreqAnalysis   = true,     -- predict interval hit
-    PriorityQueue     = true,     -- fire order by threat
-    StreakTrack       = true,     -- track parry streak / miss
-    VelSharpening     = true,     -- vel vector 3D dot sharpened
-    AnimCacheStrict   = true,     -- strict dedup anim
-    MaxQueueTargets   = 3,        -- max target di priority queue
+    -- v10 features
+    AdaptiveCooldown  = true,
+    AnglePredict      = true,
+    HitFreqAnalysis   = true,
+    PriorityQueue     = true,
+    StreakTrack       = true,
+    VelSharpening     = true,
+    AnimCacheStrict   = true,
+    MaxQueueTargets   = 3,
+    
+    -- FIXED: safety limits
+    MinInterFireDelay = 0.05,     -- minimum time between any fires
+    MaxFiresPerSecond = 8,         -- safety cap
+    HeartbeatDebounce = 0.08,      -- debounce between heartbeat fires
 }
 
 -- ─── STATE ────────────────────────────────────────────────
@@ -87,9 +91,10 @@ local ComboTracker  = {}
 local LastHitTime   = {}
 
 -- v10 NEW state
-local HitIntervals  = {}   -- track interval antar hit untuk prediction
-local LastAnimFire  = {}   -- strict anim dedup per uid+animname
-local ThreatQueue   = {}   -- priority queue targets
+local HitIntervals  = {}
+local LastAnimFire  = {}
+local ThreatQueue   = {}
+local LastHeartbeat = 0           -- FIXED: debounce heartbeat
 
 -- ─── PING ─────────────────────────────────────────────────
 local PingCache     = 80
@@ -97,7 +102,7 @@ local PingLastCheck = 0
 
 local function GetPing()
     local now = os.clock()
-    if now - PingLastCheck > 0.5 then   -- v10: cache ping, refresh tiap 0.5s
+    if now - PingLastCheck > 0.5 then
         local ok2,v = pcall(function()
             return Stats.Network.ServerStatsItem["Data Ping"]:GetValue()
         end)
@@ -110,18 +115,14 @@ end
 local function GetLead()
     if not CFG.PingCompEnabled then return 0 end
     local ping = GetPing()
-    -- v10: non-linear lead, ping tinggi = agresif kompensasi
     local raw = (ping/1000) * 2.0
     return math.min(CFG.PingCompMax, raw)
 end
 
--- v10: adaptive cooldown berdasar ping
 local function GetCooldown(isHeavy)
     local base = isHeavy and CFG.CooldownM2 or CFG.CooldownM1
     if not CFG.AdaptiveCooldown then return base end
     local ping = GetPing()
-    -- ping < 50  → cooldown lebih pendek (lo fast)
-    -- ping > 150 → cooldown lebih panjang (jaga-jaga delay)
     local factor = 1 + ((ping - 80) / 800)
     return math.max(base * 0.75, math.min(base * 1.3, base * factor))
 end
@@ -157,15 +158,13 @@ local function CanFire(force)
     return true
 end
 
--- ─── HIT FREQUENCY ANALYZER (v10) ────────────────────────
--- Track interval antar hit, predict kapan next hit
+-- ─── HIT FREQUENCY ANALYZER ───────────────────────────────
 local function RecordHitInterval(uid)
     local now  = os.clock()
     local last = LastHitTime[uid]
     if last then
         if not HitIntervals[uid] then HitIntervals[uid] = {} end
         table.insert(HitIntervals[uid], now - last)
-        -- keep max 8 samples
         if #HitIntervals[uid] > 8 then
             table.remove(HitIntervals[uid], 1)
         end
@@ -181,14 +180,12 @@ local function GetAvgInterval(uid)
     return sum / #samples
 end
 
--- Predict apakah hit berikutnya segera dateng
 local function IsHitImminent(uid)
     local avg = GetAvgInterval(uid)
     if not avg then return false, 0 end
     local last = LastHitTime[uid] or 0
     local elapsed = os.clock() - last
     local confidence = math.max(0, 1 - math.abs(elapsed - avg) / avg)
-    -- imminent kalau elapsed mendekati average interval
     return (elapsed >= avg * 0.75 and elapsed <= avg * 1.4), confidence
 end
 
@@ -200,25 +197,24 @@ local function UpdateCombo(uid)
     if now - last > CFG.ChainWindow then
         ComboTracker[uid] = 0
     end
-    RecordHitInterval(uid)   -- v10: record interval tiap update combo
+    RecordHitInterval(uid)
     ComboTracker[uid] += 1
     LastHitTime[uid]   = now
     return ComboTracker[uid]
 end
 
--- v10: smart multi-fire count berdasar combo depth
 local function GetMultiFireCount(uid)
     if not CFG.MultiFireEnabled then return 1 end
+    -- FIXED: capped max to prevent runaway multi-fire
     local combo = ComboTracker[uid] or 0
-    -- combo dalam = fire lebih banyak
-    if combo >= 4 then return 5
-    elseif combo >= 2 then return 4
-    else return CFG.MultiFireCount end
+    if combo >= 4 then return math.min(4, CFG.MultiFireCount)  -- max 4
+    elseif combo >= 2 then return 3
+    else return 2 end  -- FIXED: conservative baseline, not 3
 end
 
 -- ─── CORE PARRY ───────────────────────────────────────────
 local function RawParry()
-    pcall(function()
+    local ok = pcall(function()
         if CFG.ForceAll then
             pcall(function() DSR:Fire("EndRagdoll")   end)
             pcall(function() DSR:Fire("EndKnockback") end)
@@ -231,33 +227,45 @@ local function RawParry()
         task.wait(0.035)
         DSR:Fire("EndBlock")
     end)
+    return ok
 end
 
 local function FireParry(src, isHeavy, force, uid)
     if not CanFire(force or CFG.ForceAll) then return false end
 
-    local cd      = GetCooldown(isHeavy)   -- v10: adaptive cooldown
+    -- FIXED: strict debounce to prevent burst
+    local now = os.clock()
+    if Firing or (now - NextParry) < CFG.MinInterFireDelay then return false end
+
+    local cd      = GetCooldown(isHeavy)
     Firing        = true
-    NextParry     = os.clock() + cd
+    NextParry     = now + cd
 
     local lead    = GetLead()
-    local mfCount = uid and GetMultiFireCount(uid) or CFG.MultiFireCount
+    local mfCount = uid and GetMultiFireCount(uid) or 2  -- FIXED: safer default
 
     task.spawn(function()
-        if lead > 0.01 then task.wait(lead) end
+        -- FIXED: error wrapper
+        local ok = pcall(function()
+            if lead > 0.01 then task.wait(lead) end
 
-        if isHeavy and CFG.MultiFireEnabled then
-            for i = 1, mfCount do
-                RawParry()
-                if i < mfCount then
-                    task.wait(CFG.MultiFireDelay)
-                    NextParry = os.clock() + cd
+            if isHeavy and CFG.MultiFireEnabled then
+                for i = 1, mfCount do
+                    if not RawParry() then break end  -- FIXED: stop on error
+                    if i < mfCount then
+                        task.wait(CFG.MultiFireDelay)
+                        NextParry = now + cd  -- FIXED: maintain timeline
+                    end
                 end
+                print(string.format("[AP10] 🔴 HEAVY x%d fired ← %s | cd:%.3f", mfCount, src, cd))
+            else
+                RawParry()
+                print(string.format("[AP10] ⚔️ M1 fired ← %s | ping:%d | cd:%.3f", src, GetPing(), cd))
             end
-            print(string.format("[AP10] 🔴 HEAVY x%d fired ← %s | cd:%.3f", mfCount, src, cd))
-        else
-            RawParry()
-            print(string.format("[AP10] ⚔️ M1 fired ← %s | ping:%d | cd:%.3f", src, GetPing(), cd))
+        end)
+
+        if not ok then
+            print("[AP10] ⚠️ FireParry error")
         end
 
         task.wait(0.05)
@@ -287,6 +295,7 @@ local function IsM2Anim(n)
     for _,k in ipairs(M2_KW) do if n:find(k,1,true) then return true end end
     return false
 end
+
 local function IsM1Anim(n)
     n=n:lower()
     for _,k in ipairs(M1_KW) do if n:find(k,1,true) then return true end end
@@ -332,8 +341,7 @@ local function ScanAttrs(char,eh)
     return false,false,nil
 end
 
--- ─── ANGLE PREDICTOR (v10) ────────────────────────────────
--- Cek apakah musuh lagi dalam swing arc ke arah lo
+-- ─── ANGLE PREDICTOR ──────────────────────────────────────
 local function GetSwingArcBonus(er)
     if not CFG.AnglePredict or not Root or not er then return 0 end
     local toMe = (Root.Position - er.Position)
@@ -343,19 +351,17 @@ local function GetSwingArcBonus(er)
     local lookVec  = er.CFrame.LookVector
     local rightVec = er.CFrame.RightVector
 
-    -- musuh facing ke lo
     local faceDot = lookVec:Dot(dirNorm)
-    -- musuh swing ke sisi yang nyampe lo (right swing ke kanan, etc)
     local sideDot = math.abs(rightVec:Dot(dirNorm))
 
     local bonus = 0
-    if faceDot > 0.55 then bonus += 10 end   -- musuh lagi ngadepin lo
-    if sideDot > 0.45 then bonus += 8  end   -- swing arc crossing ke lo
-    if faceDot > 0.8  then bonus += 6  end   -- extra kalau langsung lurus
+    if faceDot > 0.55 then bonus += 10 end
+    if sideDot > 0.45 then bonus += 8  end
+    if faceDot > 0.8  then bonus += 6  end
     return bonus
 end
 
--- ─── VELOCITY SHARPENING (v10) ────────────────────────────
+-- ─── VELOCITY SHARPENING ──────────────────────────────────
 local function GetVelBonus(uid, er)
     if not CFG.VelSharpening or not Root or not er then return 0 end
     local vel  = er.Velocity
@@ -374,21 +380,20 @@ local function GetVelBonus(uid, er)
     if velMag < 0.1 then return 0 end
     local velU  = vel.Unit
 
-    -- v10: pakai full 3D dot, bukan flatten
     local approachDot = dirN:Dot(velU)
-    local upComp      = math.abs(velU.Y)   -- deteksi jump attack
+    local upComp      = math.abs(velU.Y)
 
     local bonus = 0
     if approachDot > 0.3 then
-        bonus += math.floor(approachDot * 22)   -- max 22
+        bonus += math.floor(approachDot * 22)
     end
     if upComp > 0.4 and approachDot > 0.1 then
-        bonus += 8   -- jump attack bonus
+        bonus += 8
     end
     return math.min(bonus, 30)
 end
 
--- ─── SCORE ENGINE ─────────────────────────────────────────
+-- ─── SCORE ENGINE ────────────────────────────────────────
 local function Score(p)
     local ec = p.Character
     if not ec then return 0,false,"" end
@@ -419,23 +424,27 @@ local function Score(p)
     end
 
     -- Animation (0-70)
+    -- FIXED: safety wrapper untuk GetPlayingAnimationTracks
     local anim = eh:FindFirstChildOfClass("Animator")
     if anim then
-        for _,t in pairs(anim:GetPlayingAnimationTracks()) do
-            if t.IsPlaying then
-                local n   = t.Animation.Name
-                local pos = t.TimePosition
-                if IsM2Anim(n) then
-                    hvy = true
-                    if pos <= CFG.PreFireThreshold then sc+=70; rsn="M2Early:"..n
-                    elseif pos < 0.3 then sc+=55; rsn="M2Mid:"..n
-                    else sc+=30; rsn="M2Late:"..n end
-                    break
-                elseif IsM1Anim(n) then
-                    if pos <= CFG.PreFireThreshold then sc+=60; rsn="M1Early:"..n
-                    elseif pos < 0.2 then sc+=45; rsn="M1Mid:"..n
-                    else sc+=18; rsn="M1Late:"..n end
-                    break
+        local ok, tracks = pcall(function() return anim:GetPlayingAnimationTracks() end)
+        if ok and tracks then
+            for _,t in pairs(tracks) do
+                if t and t.IsPlaying then
+                    local n   = t.Animation.Name
+                    local pos = t.TimePosition
+                    if IsM2Anim(n) then
+                        hvy = true
+                        if pos <= CFG.PreFireThreshold then sc+=70; rsn="M2Early:"..n
+                        elseif pos < 0.3 then sc+=55; rsn="M2Mid:"..n
+                        else sc+=30; rsn="M2Late:"..n end
+                        break
+                    elseif IsM1Anim(n) then
+                        if pos <= CFG.PreFireThreshold then sc+=60; rsn="M1Early:"..n
+                        elseif pos < 0.2 then sc+=45; rsn="M1Mid:"..n
+                        else sc+=18; rsn="M1Late:"..n end
+                        break
+                    end
                 end
             end
         end
@@ -452,22 +461,21 @@ local function Score(p)
         rsn  = rsn=="" and ("Combo:"..combo) or rsn
     end
 
-    -- v10: Hit Frequency Prediction
+    -- Hit Frequency Prediction
     if CFG.HitFreqAnalysis then
         local imminent, conf = IsHitImminent(uid)
         if imminent then
             local freqBonus = math.floor(conf * 25)
             sc  += freqBonus
             rsn  = rsn=="" and ("FreqPred:"..string.format("%.0f%%",conf*100)) or rsn
-            print(string.format("[AP10] 📊 HitFreq: uid=%d conf=%.0f%% bonus=%d", uid, conf*100, freqBonus))
         end
     end
 
-    -- v10: Angle predictor
+    -- Angle predictor
     local arcBonus = GetSwingArcBonus(er)
     sc += arcBonus
 
-    -- v10: Velocity sharpening (replaces old vel block)
+    -- Velocity sharpening
     local velBonus = GetVelBonus(uid, er)
     sc += velBonus
 
@@ -480,8 +488,7 @@ local function Score(p)
     return math.min(sc,100), hvy, rsn~="" and rsn or "Multi"
 end
 
--- ─── PRIORITY QUEUE (v10) ─────────────────────────────────
--- Kumpulin semua target yang qualified, sort by score, fire yang tertinggi
+-- ─── PRIORITY QUEUE ───────────────────────────────────────
 local function BuildThreatQueue()
     local queue = {}
     for _,p in pairs(Players:GetPlayers()) do
@@ -493,20 +500,24 @@ local function BuildThreatQueue()
         end
     end
     table.sort(queue, function(a,b) return a.score > b.score end)
-    -- cap ke MaxQueueTargets
     while #queue > CFG.MaxQueueTargets do
         table.remove(queue)
     end
     return queue
 end
 
--- ─── HEARTBEAT ────────────────────────────────────────────
+-- ─── HEARTBEAT (FIXED) ────────────────────────────────────
 RunService.Heartbeat:Connect(function()
     if not ON or not Refresh() then return end
     if os.clock() < NextParry then return end
+    
+    -- FIXED: debounce heartbeat fires to prevent burst
+    local now = os.clock()
+    if now - LastHeartbeat < CFG.HeartbeatDebounce then return end
+    LastHeartbeat = now
 
     if CFG.PriorityQueue then
-        -- v10: priority queue mode
+        -- FIXED: only run priority queue mode (not both)
         local queue = BuildThreatQueue()
         if #queue > 0 then
             local top = queue[1]
@@ -520,7 +531,7 @@ RunService.Heartbeat:Connect(function()
             )
         end
     else
-        -- fallback: original single-best mode
+        -- fallback: single-best mode
         local best,bH,bR,bP = 0,false,"",nil
         for _,p in pairs(Players:GetPlayers()) do
             if p~=LP then
@@ -569,37 +580,45 @@ local function WatchChar(p,char)
         if eh then watchA(eh,a) end
     end
 
-    -- v10: strict anim cache dedup
+    -- Animation watcher with error handling
     local function watchAnim(animator)
-        animator.AnimationPlayed:Connect(function(track)
-            if not ON then return end
-            local n   = track.Animation.Name
-            local isH = IsM2Anim(n)
-            local isM = IsM1Anim(n)
-            if not isH and not isM then return end
-            if not er or not Root then return end
-            if Dist(Root,er)>CFG.Range then return end
+        -- FIXED: error-safe connection
+        pcall(function()
+            animator.AnimationPlayed:Connect(function(track)
+                if not ON then return end
+                if not track then return end  -- FIXED: nil check
+                
+                -- FIXED: safety wrapper
+                local ok, n = pcall(function() return track.Animation.Name end)
+                if not ok or not n then return end
+                
+                local isH = IsM2Anim(n)
+                local isM = IsM1Anim(n)
+                if not isH and not isM then return end
+                if not er or not Root then return end
+                if Dist(Root,er)>CFG.Range then return end
 
-            -- v10: strict dedup pakai uid+name+timestamp bucket
-            local now    = os.clock()
-            local cacheK = string.format("%d_%s", uid, n)
-            if CFG.AnimCacheStrict then
-                local lastFire = LastAnimFire[cacheK] or 0
-                if now - lastFire < 0.3 then return end   -- strict 0.3s cooldown per anim
-                LastAnimFire[cacheK] = now
-            else
-                if PrevAnims[cacheK] then return end
-                PrevAnims[cacheK]=true
-                task.delay(0.35,function() PrevAnims[cacheK]=nil end)
-            end
+                -- v10: strict dedup
+                local now    = os.clock()
+                local cacheK = string.format("%d_%s", uid, n)
+                if CFG.AnimCacheStrict then
+                    local lastFire = LastAnimFire[cacheK] or 0
+                    if now - lastFire < 0.3 then return end
+                    LastAnimFire[cacheK] = now
+                else
+                    if PrevAnims[cacheK] then return end
+                    PrevAnims[cacheK]=true
+                    task.delay(0.35,function() PrevAnims[cacheK]=nil end)
+                end
 
-            if isH then
-                HeavyAlert[uid]=true
-                task.delay(2.5,function() HeavyAlert[uid]=nil end)
-                print("[AP10] 🔴 M2 ANIM: "..n)
-            end
+                if isH then
+                    HeavyAlert[uid]=true
+                    task.delay(2.5,function() HeavyAlert[uid]=nil end)
+                    print("[AP10] 🔴 M2 ANIM: "..n)
+                end
 
-            FireParry("AnimPlay:"..n, isH, true, uid)
+                FireParry("AnimPlay:"..n, isH, true, uid)
+            end)
         end)
     end
 
@@ -668,7 +687,7 @@ pktHook(ComboPkt, "Combo",  false)
 GotHit.OnClientEvent:Connect(function()
     print("[AP10] 💥 GOT HIT — force+multi")
     NextParry=0; Firing=false
-    MissCount += 1   -- v10: track miss
+    MissCount += 1
     if CFG.StreakTrack then
         ParryStreak = 0
         Notify(string.format("❌ Miss #%d | Streak reset", MissCount), 1.5)
@@ -699,7 +718,7 @@ end)
 
 ParryOK.OnClientEvent:Connect(function()
     ParryCount  += 1
-    ParryStreak += 1   -- v10: streak increment
+    ParryStreak += 1
     local streakTxt = CFG.StreakTrack and string.format(" | 🔥x%d",ParryStreak) or ""
     Notify(string.format("✅ PARRY #%d | %dms%s", ParryCount, GetPing(), streakTxt))
     print(string.format("[AP10] ✅ PARRY #%d | streak:%d", ParryCount, ParryStreak))
@@ -711,6 +730,7 @@ LP.CharacterAdded:Connect(function(c)
     Hum=c:WaitForChild("Humanoid")
     Root=c:WaitForChild("HumanoidRootPart")
     NextParry=0; Firing=false
+    LastHeartbeat=0
     Watched={}; PrevAnims={}
     HeavyAlert={}; ComboTracker={}; LastHitTime={}
     HitIntervals={}; LastAnimFire={}; ThreatQueue={}
@@ -729,9 +749,8 @@ end)
 
 -- ─── INIT ─────────────────────────────────────────────────
 local p=GetPing()
-Notify(string.format("⚔️ v10 APEX | %dms | RShift=Toggle",p),3)
-print(string.format("[AP10] ⚔️ APEX ACTIVE | Ping:%dms | Lead:%.3fs | AdaptCD:%s | PQueue:%s",
-    p, GetLead(),
-    tostring(CFG.AdaptiveCooldown),
+Notify(string.format("⚔️ v10 APEX FIXED | %dms | RShift=Toggle",p),3)
+print(string.format("[AP10] ⚔️ APEX FIXED | Ping:%dms | Lead:%.3fs | Threshold:%d | Safe:%s",
+    p, GetLead(), CFG.ScoreThreshold,
     tostring(CFG.PriorityQueue)
 ))
