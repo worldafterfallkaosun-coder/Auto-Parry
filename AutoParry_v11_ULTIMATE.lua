@@ -1,6 +1,6 @@
--- Auto Parry v12 — GODMODE EDITION
--- Rebuilt detection: dual-layer (pre-anim + post-anim), M2 pre-fire, combo lock
--- Silent mode, zero console spam
+-- Auto Parry v12.1 — GODMODE + PING FIX
+-- Patch: aggressive ping compensation, dynamic tap window, cooldown inversion
+-- Silent mode
 
 local Players           = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -19,7 +19,7 @@ local ok, Packets = pcall(function()
                                :WaitForChild("Shared",5)
     return require(S:WaitForChild("Packets",5))
 end)
-if not ok then warn("[AP12] Packets failed"); return end
+if not ok then warn("[AP12.1] Packets failed"); return end
 
 local DSR       = Packets.DefenseStateRequest
 local CTChanged = Packets.CombatTagChanged
@@ -43,23 +43,21 @@ local CFG = {
     TapWindow          = 0.038,
     CooldownM1         = 0.28,
     CooldownM2         = 0.20,
-    ScoreThreshold     = 18,      -- lebih rendah = lebih sensitif
+    ScoreThreshold     = 18,
     ToggleKey          = Enum.KeyCode.RightShift,
 
-    PreFireThreshold   = 0.05,    -- fire makin awal
+    PreFireThreshold   = 0.08,    -- v12.1: lebih lebar
 
-    -- Multi-fire untuk combo spam
     MultiFireEnabled   = true,
     MultiFireBase      = 3,
-    MultiFireMax       = 6,       -- naik ke 6 untuk combo spam
-    MultiFireDelay     = 0.08,    -- lebih ketat
+    MultiFireMax       = 6,
+    MultiFireDelay     = 0.07,    -- v12.1: lebih ketat
 
-    ChainWindow        = 1.0,     -- window combo lebih lebar
-
+    ChainWindow        = 1.0,
     ForceAll           = true,
 
     PingCompEnabled    = true,
-    PingCompMax        = 0.45,
+    PingCompMax        = 0.65,    -- v12.1: naik dari 0.45
 
     AdaptiveCooldown   = true,
     AnglePredict       = true,
@@ -67,31 +65,26 @@ local CFG = {
     AnimCacheStrict    = true,
     MaxQueueTargets    = 5,
 
-    -- v12 GODMODE
-    FiringTimeout      = 0.8,     -- lebih pendek, biar ga stuck lama
-    SelfGuard          = true,    -- jaga lo ga ke-interrupt
+    FiringTimeout      = 0.8,
+    SelfGuard          = true,
     ToolSelfGuard      = true,
 
-    -- v12: Dual-layer detection
-    PreAnimDetect      = true,    -- detect SEBELUM anim via attr spike
-    VelPreFire         = true,    -- fire dari velocity spike aja
-    VelPreFireThresh   = 8,       -- sensitivity velocity pre-fire
+    PreAnimDetect      = true,
+    VelPreFire         = true,
+    VelPreFireThresh   = 8,
 
-    -- v12: Combo lock mode
-    ComboLockEnabled   = true,    -- kalau masuk combo, lock parry window
-    ComboLockWindow    = 0.22,    -- tiap berapa detik expect hit berikutnya
-    ComboLockMax       = 8,       -- max combo lock cycles
+    ComboLockEnabled   = true,
+    ComboLockWindow    = 0.22,
+    ComboLockMax       = 8,
 
-    -- v12: M2 pre-fire
-    M2PreFireEnabled   = true,    -- fire segera saat M2 attr detected
-    M2PreFireExtra     = 2,       -- extra fire count untuk M2
+    M2PreFireEnabled   = true,
+    M2PreFireExtra     = 2,
 
-    -- v12: Adaptive threshold
-    AdaptiveThreshold  = true,    -- threshold turun kalau sering miss
-    ThresholdFloor     = 12,      -- minimum threshold
-    MissDecay          = 2,       -- threshold turun per miss
+    AdaptiveThreshold  = true,
+    ThresholdFloor     = 12,
+    MissDecay          = 2,
 
-    HeartbeatDebounce  = 0.02,    -- lebih responsif
+    HeartbeatDebounce  = 0.02,
     HistoryDepth       = 20,
 }
 
@@ -102,8 +95,8 @@ local Firing         = false
 local FiringAt       = 0
 local ParryCount     = 0
 local MissCount      = 0
-local ConsecMiss     = 0          -- v12: consecutive miss tracker
-local DynThreshold   = CFG.ScoreThreshold  -- v12: dynamic threshold
+local ConsecMiss     = 0
+local DynThreshold   = CFG.ScoreThreshold
 local Watched        = {}
 local PrevVel        = {}
 local PrevAnims      = {}
@@ -113,14 +106,12 @@ local LastHitTime    = {}
 local HitHistory     = {}
 local LastAnimFire   = {}
 local LastHeartbeat  = 0
-
--- v12 GODMODE state
-local ComboLockActive  = {}   -- uid → bool, lagi di combo lock
-local ComboLockUntil   = {}   -- uid → timestamp batas lock
-local ComboLockCount   = {}   -- uid → berapa cycle tersisa
-local LastVelSpike     = {}   -- uid → last velocity spike time
-local M2Detected       = {}   -- uid → M2 detected flag
-local AttackTypeSeq    = {}   -- uid → sequence type
+local ComboLockActive  = {}
+local ComboLockUntil   = {}
+local ComboLockCount   = {}
+local LastVelSpike     = {}
+local M2Detected       = {}
+local AttackTypeSeq    = {}
 
 -- ─── SELF ATTACK ATTRS ────────────────────────────────────
 local SELF_ATKS = {
@@ -128,13 +119,13 @@ local SELF_ATKS = {
     "M1","Swinging","InAttack","AttackState","HitActive","StrikeActive",
 }
 
--- ─── PING ─────────────────────────────────────────────────
+-- ─── PING (v12.1 PATCH) ───────────────────────────────────
 local PingCache     = 80
 local PingLastCheck = 0
 
 local function GetPing()
     local now = os.clock()
-    if now - PingLastCheck > 0.4 then
+    if now - PingLastCheck > 0.3 then
         local ok2,v = pcall(function()
             return Stats.Network.ServerStatsItem["Data Ping"]:GetValue()
         end)
@@ -146,14 +137,28 @@ end
 
 local function GetLead()
     if not CFG.PingCompEnabled then return 0 end
-    return math.min(CFG.PingCompMax, (GetPing()/1000) * 2.5)
+    local ping = GetPing()
+    -- ping 80  → ~0.18s
+    -- ping 150 → ~0.33s
+    -- ping 250 → ~0.55s
+    -- ping 400 → 0.65s (cap)
+    local raw = (ping / 1000) * 3.2
+    return math.min(CFG.PingCompMax, raw)
 end
 
 local function GetCooldown(isHeavy)
     local base = isHeavy and CFG.CooldownM2 or CFG.CooldownM1
     if not CFG.AdaptiveCooldown then return base end
-    local f = 1 + ((GetPing() - 80) / 750)
-    return math.max(base * 0.65, math.min(base * 1.3, base * f))
+    local ping = GetPing()
+    -- v12.1 PATCH: ping tinggi = cooldown LEBIH PENDEK
+    -- kebalikan dari sebelumnya, biar bisa re-fire lebih sering
+    if ping > 150 then
+        local reduction = math.min(0.08, (ping - 150) / 2000)
+        return math.max(base * 0.60, base - reduction)
+    end
+    -- ping normal: sedikit naikin cooldown biar stabil
+    local factor = 1 + ((ping - 80) / 1200)
+    return math.max(base * 0.75, math.min(base * 1.15, base * factor))
 end
 
 -- ─── HELPERS ──────────────────────────────────────────────
@@ -172,10 +177,10 @@ end
 
 local function Notify(t,d)
     pcall(game.StarterGui.SetCore, game.StarterGui,
-        "SendNotification",{Title="⚔️ AP v12",Text=t,Duration=d or 2})
+        "SendNotification",{Title="⚔️ AP v12.1",Text=t,Duration=d or 2})
 end
 
--- ─── SELF ATTACK GUARD ────────────────────────────────────
+-- ─── SELF GUARD ───────────────────────────────────────────
 local function IsSelfAttacking()
     if not CFG.SelfGuard then return false end
     if not Char then return false end
@@ -191,7 +196,6 @@ local function IsSelfAttacking()
 end
 
 -- ─── DYNAMIC THRESHOLD ────────────────────────────────────
--- kalau sering miss, threshold otomatis turun biar lebih sensitif
 local function UpdateThreshold(missed)
     if not CFG.AdaptiveThreshold then return end
     if missed then
@@ -199,10 +203,8 @@ local function UpdateThreshold(missed)
         DynThreshold  = math.max(CFG.ThresholdFloor,
             DynThreshold - CFG.MissDecay * math.min(ConsecMiss, 3))
     else
-        ConsecMiss   = 0
-        -- slowly recover threshold
-        DynThreshold = math.min(CFG.ScoreThreshold,
-            DynThreshold + 1)
+        ConsecMiss    = 0
+        DynThreshold  = math.min(CFG.ScoreThreshold, DynThreshold + 1)
     end
 end
 
@@ -210,7 +212,6 @@ end
 local function CanFire(force)
     if not ON then return false end
     if Firing then
-        -- safety timeout
         if os.clock() - FiringAt > CFG.FiringTimeout then
             Firing = false
         else
@@ -249,9 +250,7 @@ local function GetAvgInterval(uid)
     return n > 0 and (sum/n) or nil
 end
 
--- ─── v12: COMBO LOCK ──────────────────────────────────────
--- Ketika detect combo, aktifin lock mode:
--- tiap ComboLockWindow detik, auto-fire parry tanpa nunggu score
+-- ─── COMBO LOCK ───────────────────────────────────────────
 local function ActivateComboLock(uid, cycles)
     if not CFG.ComboLockEnabled then return end
     local c = math.min(cycles or 4, CFG.ComboLockMax)
@@ -267,9 +266,8 @@ local function TickComboLock(uid)
         if ComboLockCount[uid] > 0 then
             ComboLockCount[uid] -= 1
             ComboLockUntil[uid]  = now + CFG.ComboLockWindow
-            return true   -- fire now
+            return true
         else
-            -- lock expired
             ComboLockActive[uid] = false
             ComboLockCount[uid]  = 0
             return false
@@ -284,21 +282,17 @@ local function UpdateCombo(uid, isHeavy, src)
     local last = LastHitTime[uid] or 0
     if not ComboTracker[uid] then ComboTracker[uid] = 0 end
     if now - last > CFG.ChainWindow then
-        ComboTracker[uid] = 0
+        ComboTracker[uid]    = 0
         ComboLockActive[uid] = false
     end
     RecordHit(uid, isHeavy, src)
     ComboTracker[uid] += 1
-
-    -- v12: aktifin combo lock saat combo >= 2
     if ComboTracker[uid] >= 2 then
         local avg = GetAvgInterval(uid)
         if avg and avg < 0.6 then
-            -- combo cepet, lock agresif
             ActivateComboLock(uid, math.min(ComboTracker[uid] + 2, CFG.ComboLockMax))
         end
     end
-
     return ComboTracker[uid]
 end
 
@@ -306,57 +300,61 @@ local function GetMultiFire(uid, isHeavy)
     if not CFG.MultiFireEnabled then return 1 end
     local combo = ComboTracker[uid] or 0
     local base  = CFG.MultiFireBase
-
-    if isHeavy then
-        base = base + CFG.M2PreFireExtra
-    end
-
+    if isHeavy then base = base + CFG.M2PreFireExtra end
     if combo >= 5 then base = CFG.MultiFireMax
     elseif combo >= 3 then base = base + 2
-    elseif combo >= 1 then base = base + 1
-    end
-
-    -- avg interval pendek = fire lebih banyak
+    elseif combo >= 1 then base = base + 1 end
     local avg = GetAvgInterval(uid)
     if avg and avg < 0.25 then
         base = math.min(CFG.MultiFireMax, base + 1)
     end
-
+    -- v12.1: ping tinggi = multi fire lebih banyak untuk kompensasi
+    local ping = GetPing()
+    if ping > 150 then
+        base = math.min(CFG.MultiFireMax, base + 1)
+    end
+    if ping > 250 then
+        base = math.min(CFG.MultiFireMax, base + 1)
+    end
     return math.min(CFG.MultiFireMax, base)
 end
 
--- ─── CORE PARRY ───────────────────────────────────────────
+-- ─── CORE PARRY (v12.1 PATCH) ─────────────────────────────
 local function RawParry()
     pcall(function()
+        local ping = GetPing()
         if CFG.ForceAll then
             pcall(function() DSR:Fire("EndRagdoll")   end)
             pcall(function() DSR:Fire("EndKnockback") end)
-            -- CancelAction TIDAK dipanggil, ini yang bikin bug attack sendiri
+            -- CancelAction TIDAK dipanggil — ini yang bikin bug
         end
-        task.wait(0.01)
+        -- v12.1: TapWindow dinamis
+        -- ping tinggi = tap lebih pendek biar parry nyampe server tepat waktu
+        local dynTap = ping > 150
+            and math.max(0.022, CFG.TapWindow - (ping - 150) / 8000)
+            or  CFG.TapWindow
+
+        task.wait(0.008)
         DSR:Fire("BeginBlock")
-        task.wait(CFG.TapWindow)
+        task.wait(dynTap)
         DSR:Fire("BeginParry")
-        task.wait(0.032)
+        task.wait(0.026)   -- v12.1: dipercepat dari 0.032
         DSR:Fire("EndBlock")
     end)
 end
 
 local function FireParry(src, isHeavy, force, uid)
     if not CanFire(force) then return false end
-
     local cd      = GetCooldown(isHeavy)
     Firing        = true
     FiringAt      = os.clock()
     NextParry     = os.clock() + cd
-
     local lead    = GetLead()
     local mfCount = GetMultiFire(uid, isHeavy)
 
     task.spawn(function()
         pcall(function()
             if lead > 0.005 then task.wait(lead) end
-
             if isHeavy and CFG.MultiFireEnabled then
                 for i = 1, mfCount do
                     if IsSelfAttacking() then break end
@@ -372,18 +370,14 @@ local function FireParry(src, isHeavy, force, uid)
         task.wait(0.04)
         Firing = false
     end)
-
     return true
 end
 
--- v12: Immediate M2 fire — bypass normal cooldown untuk M2
+-- v12: M2 immediate bypass
 local function FireM2Immediate(uid)
     if not CFG.M2PreFireEnabled then return end
-    -- reset firing state paksa untuk M2
-    if Firing and os.clock() - FiringAt > 0.1 then
-        Firing = false
-    end
-    NextParry = 0   -- bypass cooldown untuk M2
+    if Firing and os.clock() - FiringAt > 0.1 then Firing = false end
+    NextParry = 0
     FireParry("M2Imm", true, true, uid)
 end
 
@@ -455,12 +449,12 @@ end
 -- ─── ANGLE PREDICTOR ──────────────────────────────────────
 local function GetSwingArcBonus(er)
     if not CFG.AnglePredict or not Root or not er then return 0 end
-    local toMe    = (Root.Position - er.Position)
-    local dist    = toMe.Magnitude
+    local toMe   = (Root.Position - er.Position)
+    local dist   = toMe.Magnitude
     if dist < 0.1 then return 0 end
-    local dirN     = toMe / dist
-    local faceDot  = er.CFrame.LookVector:Dot(dirN)
-    local sideDot  = math.abs(er.CFrame.RightVector:Dot(dirN))
+    local dirN    = toMe / dist
+    local faceDot = er.CFrame.LookVector:Dot(dirN)
+    local sideDot = math.abs(er.CFrame.RightVector:Dot(dirN))
     local bonus = 0
     if faceDot > 0.5  then bonus += 14 end
     if sideDot > 0.4  then bonus += 10 end
@@ -487,21 +481,20 @@ local function GetVelBonus(uid, er)
     return math.min(bonus, 42)
 end
 
--- v12: velocity pre-fire — fire dari vel spike aja tanpa nunggu anim
-local function CheckVelPreFire(uid, er, p)
+local function CheckVelPreFire(uid, er)
     if not CFG.VelPreFire or not Root or not er then return end
     local vel  = er.Velocity
     local prev = PrevVel[uid] or vel
     local acc  = (vel - prev).Magnitude
-
     if acc >= CFG.VelPreFireThresh then
         local toMe = (Root.Position - er.Position)
         if toMe.Magnitude < 0.1 then return end
+        if vel.Magnitude < 0.1 then return end
         local dot = toMe.Unit:Dot(vel.Unit)
         if dot > 0.3 then
-            local now = os.clock()
+            local now  = os.clock()
             local last = LastVelSpike[uid] or 0
-            if now - last > 0.15 then
+            if now - last > 0.13 then
                 LastVelSpike[uid] = now
                 FireParry("VelSpike", false, true, uid)
             end
@@ -517,17 +510,14 @@ local function Score(p)
     local eh = ec:FindFirstChildWhichIsA("Humanoid")
     if not er or not eh or eh.Health<=0 then return 0,false,"" end
     if not Root then return 0,false,"" end
-
     local d = Dist(Root,er)
     if d > CFG.Range then return 0,false,"" end
 
     local sc=0; local hvy=false; local rsn=""
     local uid = p.UserId
 
-    -- Distance (0-15)
     sc += math.floor((1 - d/CFG.Range) * 15)
 
-    -- Attr (0-80)
     local hasAttr,isHAttr,attrN = ScanAttrs(ec,eh)
     if isHAttr then
         sc+=80; hvy=true; rsn="HvyAttr:"..attrN
@@ -535,7 +525,6 @@ local function Score(p)
         sc+=50; rsn="Attr:"..tostring(attrN)
     end
 
-    -- Anim (0-75)
     local anim = eh:FindFirstChildOfClass("Animator")
     if anim then
         local ok2,tracks = pcall(function() return anim:GetPlayingAnimationTracks() end)
@@ -562,14 +551,12 @@ local function Score(p)
 
     if HeavyAlert[uid] then sc+=30; hvy=true end
 
-    -- Combo (0-50)
     local combo = ComboTracker[uid] or 0
     if combo > 0 then
         sc += math.min(combo * 12, 50)
         rsn = rsn=="" and ("Combo:"..combo) or rsn
     end
 
-    -- Avg interval bonus (cepet = score lebih tinggi)
     local avg = GetAvgInterval(uid)
     if avg and avg < 0.4 then
         sc += math.floor((1 - avg/0.4) * 20)
@@ -611,20 +598,17 @@ RunService.Heartbeat:Connect(function()
     if now - LastHeartbeat < CFG.HeartbeatDebounce then return end
     LastHeartbeat = now
 
-    -- v12: tick combo lock untuk semua player
     for _,p in pairs(Players:GetPlayers()) do
         if p ~= LP and p.Character then
             local er = p.Character:FindFirstChild("HumanoidRootPart")
             if er and Root and Dist(Root,er) <= CFG.Range then
                 local uid = p.UserId
-                -- combo lock fire
                 if ComboLockActive[uid] and TickComboLock(uid) then
                     if now >= NextParry then
                         FireParry("ComboLock", false, true, uid)
                     end
                 end
-                -- vel pre-fire
-                CheckVelPreFire(uid, er, p)
+                CheckVelPreFire(uid, er)
             end
         end
     end
@@ -643,9 +627,7 @@ RunService.Heartbeat:Connect(function()
             string.format("[%d]%s/%s",top.score,top.reason,top.player.Name),
             top.heavy,true,uid
         )
-        if fired then
-            UpdateThreshold(false)   -- hit detected, recover threshold
-        end
+        if fired then UpdateThreshold(false) end
     end
 end)
 
@@ -656,7 +638,6 @@ local function WatchChar(p,char)
     local eh  = char:FindFirstChildWhichIsA("Humanoid")
     local uid = p.UserId
 
-    -- Attr watcher
     local function watchA(obj,attr)
         pcall(function()
             obj:GetAttributeChangedSignal(attr):Connect(function()
@@ -672,7 +653,6 @@ local function WatchChar(p,char)
                 if isHvy then
                     HeavyAlert[uid]=true
                     task.delay(3,function() HeavyAlert[uid]=nil end)
-                    -- v12: M2 pre-fire bypass
                     if not M2Detected[uid] then
                         M2Detected[uid]=true
                         task.delay(2,function() M2Detected[uid]=nil end)
@@ -690,7 +670,6 @@ local function WatchChar(p,char)
         if eh then watchA(eh,a) end
     end
 
-    -- Anim watcher
     local function watchAnim(animator)
         pcall(function()
             animator.AnimationPlayed:Connect(function(track)
@@ -731,7 +710,6 @@ local function WatchChar(p,char)
         end) end
     end
 
-    -- Tool equip (enemy only)
     char.ChildAdded:Connect(function(c)
         if not c:IsA("Tool") then return end
         if CFG.ToolSelfGuard and char==LP.Character then return end
@@ -791,8 +769,7 @@ pktHook(ComboPkt,"Combo",false)
 GotHit.OnClientEvent:Connect(function()
     NextParry=0; Firing=false
     MissCount+=1
-    UpdateThreshold(true)   -- v12: update threshold saat kena hit
-
+    UpdateThreshold(true)
     if Root then
         for _,p in pairs(Players:GetPlayers()) do
             if p~=LP and p.Character then
@@ -800,7 +777,6 @@ GotHit.OnClientEvent:Connect(function()
                 if er and Dist(Root,er)<=CFG.Range then
                     local uid=p.UserId
                     UpdateCombo(uid,false,"GotHit")
-                    -- v12: aktivasi combo lock agresif saat kena hit
                     ActivateComboLock(uid, CFG.ComboLockMax)
                 end
             end
@@ -839,9 +815,9 @@ UIS.InputBegan:Connect(function(i,g)
     if g then return end
     if i.KeyCode==CFG.ToggleKey then
         ON=not ON; NextParry=0; Firing=false
-        Notify(ON and "✅ v12 ON" or "❌ v12 OFF")
+        Notify(ON and "✅ v12.1 ON" or "❌ v12.1 OFF")
     end
 end)
 
 -- ─── INIT ─────────────────────────────────────────────────
-Notify("⚔️ Auto Parry v12 GODMODE", 2)
+Notify("⚔️ Auto Parry v12.1 GODMODE + PING FIX", 2)
