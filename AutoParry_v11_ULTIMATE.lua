@@ -1,10 +1,10 @@
 -- ════════════════════════════════════════════════════════════════
 --  Auto Aim v4.2
---  Upgrade dari v4.1:
---  • Lock expire → TIDAK auto switch, cuma unlock doang
---  • LOCK_DURATION naik jadi 30s
---  • Parry hanya dari DEPAN, KANAN, KIRI (bukan belakang)
---  • Semua sistem lama tetap utuh
+--  Trigger: GotHit (kena hit) + HitSomeone (lo ngehit)
+--  AlignOrientation — lock ga lepas pas gerak
+--  Camera: PURE DEFAULT
+--  v4.2: expired = unlock doang, no auto switch
+--        durasi lock naik ke 30s
 -- ════════════════════════════════════════════════════════════════
 
 local Players           = game:GetService("Players")
@@ -48,46 +48,23 @@ local CFG = {
     AUTO_AIM           = true,
     AIM_RANGE          = 80,
 
-    -- ─── DURASI LOCK ───────────────────────────────────────
-    LOCK_DURATION      = 30,      -- ✅ UPGRADE: dari 15 → 30 detik
+    -- v4.2: durasi naik ke 30s
+    LOCK_DURATION      = 30,
 
-    -- ─── EXPIRE BEHAVIOR ───────────────────────────────────
-    -- false = kalau habis, cuma unlock, TIDAK pindah target
-    AUTO_SWITCH_ON_EXPIRE = false, -- ✅ UPGRADE: default v4.1 = true, sekarang false
-
-    -- AlignOrientation
     MAX_TORQUE         = 1e6,
     RESPONSIVENESS     = 35,
 
-    -- Prediction
     PREDICT_ENABLED    = true,
     PREDICT_FACTOR     = 0.10,
 
-    -- Sticky target
     STICK_TO_TARGET    = true,
     STICKY_RANGE_MULT  = 1.6,
 
-    -- Proximity hit detection fallback
     PROXIMITY_HIT_RANGE = 12,
 
-    -- ─── PARRY DIRECTION ───────────────────────────────────
-    -- ✅ UPGRADE: parry hanya dari DEPAN, KANAN, KIRI
-    -- Belakang diblokir supaya ga suspicious
-    PARRY_ENABLED      = true,
-    PARRY_FRONT_ANGLE  = 130,  -- derajat total dari depan yang diterima
-                               -- 130° = ±65° dari hadapan lo
-                               -- Kiri & kanan masuk, belakang keluar
-    -- Penjelasan:
-    -- dot > cos(65°) ≈ 0.42  → FRONT ZONE (aman, parry)
-    -- dot < -0.42             → BACK ZONE  (skip, jangan parry)
-    -- antara -0.42 dan 0.42  → SIDE ZONE  (parry)
-    -- Jadi: front + left + right = parry | back = skip
-
-    -- Username filter
     USERNAME_MODE      = "none",
     USERNAME_LIST      = {},
 
-    -- State blocks
     BLOCKED_STATES = {
         "State_Ragdolled",
         "State_Safe",
@@ -189,67 +166,33 @@ local function IsTargetValid(t)
 end
 
 -- ════════════════════════════════════════════════════════════
---  ✅ UPGRADE: PARRY DIRECTION FILTER
---  Cek apakah attacker ada di DEPAN / SAMPING lo
---  Kalau dari belakang → return false → skip parry
--- ════════════════════════════════════════════════════════════
-local function IsParryableDirection(attackerRootPos)
-    if not CFG.PARRY_ENABLED then return true end
-    local root = GetRoot(); if not root then return false end
-
-    -- Forward vector karakter lo (dari CFrame)
-    local myForward = root.CFrame.LookVector
-
-    -- Arah dari lo ke attacker
-    local toAttacker = (attackerRootPos - root.Position)
-    toAttacker = Vector3.new(toAttacker.X, 0, toAttacker.Z)
-    if toAttacker.Magnitude < 0.01 then return true end
-    toAttacker = toAttacker.Unit
-
-    -- Dot product: 1 = tepat depan, -1 = tepat belakang
-    local dot = myForward:Dot(toAttacker)
-
-    -- cos(65°) ≈ 0.4226 — threshold batas belakang
-    -- Kalau dot < -0.4226 = attacker ada DI BELAKANG lo → skip
-    local backThreshold = -math.cos(math.rad(CFG.PARRY_FRONT_ANGLE / 2))
-
-    if dot < backThreshold then
-        Log("Parry blocked — attacker dari belakang | dot:", dot)
-        return false
-    end
-
-    Log("Parry allowed | dot:", dot)
-    return true
-end
-
--- ════════════════════════════════════════════════════════════
 --  ALIGN ORIENTATION CONSTRAINT
 -- ════════════════════════════════════════════════════════════
 local function SetupConstraint()
     local root = GetRoot(); if not root then return end
 
     pcall(function()
-        if State.AlignOri      then State.AlignOri:Destroy()      end
-        if State.Att0          then State.Att0:Destroy()           end
+        if State.AlignOri       then State.AlignOri:Destroy()       end
+        if State.Att0           then State.Att0:Destroy()           end
         if State.ConstraintPart then State.ConstraintPart:Destroy() end
     end)
 
     local att0 = Instance.new("Attachment")
-    att0.Name  = "_AA_Att0"
-    att0.Parent= root
-    State.Att0 = att0
+    att0.Name   = "_AA_Att0"
+    att0.Parent = root
+    State.Att0  = att0
 
     local ao = Instance.new("AlignOrientation")
-    ao.Name                = "_AA_AO"
-    ao.Mode                = Enum.OrientationAlignmentMode.OneAttachment
-    ao.Attachment0         = att0
-    ao.MaxTorque           = CFG.MAX_TORQUE
-    ao.MaxAngularVelocity  = math.huge
-    ao.Responsiveness      = CFG.RESPONSIVENESS
-    ao.RigidityEnabled     = false
-    ao.PrimaryAxisOnly     = false
-    ao.Parent              = root
-    State.AlignOri         = ao
+    ao.Name               = "_AA_AO"
+    ao.Mode               = Enum.OrientationAlignmentMode.OneAttachment
+    ao.Attachment0        = att0
+    ao.MaxTorque          = CFG.MAX_TORQUE
+    ao.MaxAngularVelocity = math.huge
+    ao.Responsiveness     = CFG.RESPONSIVENESS
+    ao.RigidityEnabled    = false
+    ao.PrimaryAxisOnly    = false
+    ao.Parent             = root
+    State.AlignOri        = ao
 
     Log("Constraint ready")
 end
@@ -275,7 +218,7 @@ local function SetAimDir(targetPos)
     local up    = Vector3.new(0, 1, 0)
     local right = dir:Cross(up)
     if right.Magnitude < 0.01 then return end
-    right = right.Unit
+    right   = right.Unit
     local newUp = right:Cross(dir).Unit
 
     State.AlignOri.CFrame = CFrame.fromMatrix(Vector3.zero, right, newUp)
@@ -384,29 +327,9 @@ end
 -- ════════════════════════════════════════════════════════════
 --  TRIGGER: LO KENA HIT
 -- ════════════════════════════════════════════════════════════
-GotHit.OnClientEvent:Connect(function(attackerInfo)
+GotHit.OnClientEvent:Connect(function()
     if not CFG.AUTO_AIM then return end
     State.InCombat = true
-
-    -- ✅ Cek parry direction dulu sebelum lock
-    -- Coba ambil posisi attacker dari packet (kalau ada)
-    local attackerPos = nil
-    if attackerInfo and typeof(attackerInfo) == "Instance" then
-        if attackerInfo:IsA("Player") and attackerInfo.Character then
-            local ar = attackerInfo.Character:FindFirstChild("HumanoidRootPart")
-            if ar then attackerPos = ar.Position end
-        end
-    end
-
-    -- Kalau ada info posisi attacker, filter arah
-    if attackerPos then
-        if not IsParryableDirection(attackerPos) then
-            Log("GotHit dari belakang — skip parry/lock")
-            return
-        end
-    end
-    -- Kalau ga ada info posisi (packet ga kirim), tetap lock (safe default)
-
     local best = GetBestTarget(true)
     if best then
         LockOn(best, "kena hit")
@@ -493,27 +416,19 @@ RunService.Heartbeat:Connect(function(dt)
 
     ProximityHitCheck()
 
-    -- ✅ UPGRADE: lock expire → TIDAK auto switch, cuma unlock
+    -- v4.2: expired = unlock doang, NO auto switch ke target lain
     if State.CurrentTarget and LockIsExpired() then
         local expiredName = State.CurrentTarget.Name
-        UnlockAll("lock expired ("..expiredName..")")
-        -- ❌ DIHAPUS: auto switch ke candidate lain
-        -- Sekarang cukup unlock, tunggu trigger baru
-        Notify("🔓 Lock expired: "..expiredName, 2)
+        UnlockAll("lock expired: "..expiredName)
+        Notify("🔓 Lock expired: "..expiredName)
         return
     end
 
-    -- validate target
+    -- v4.2: target invalid (mati/keluar range) = unlock doang, NO auto switch
     if State.CurrentTarget and not IsTargetValid(State.CurrentTarget) then
-        local deadName = State.CurrentTarget.Name
-        UnlockAll("target invalid: "..deadName)
-        -- ✅ Auto switch tetap jalan kalau target MATI/keluar range
-        -- Ini beda dari expire — ini karena target emang udah ga valid
-        -- Kalau mau disable ini juga, comment block di bawah
-        GetBestTarget(true)
-        if #State.Candidates > 0 then
-            LockOn(State.Candidates[1].p, "auto switch (invalid)")
-        end
+        local invalidName = State.CurrentTarget.Name
+        UnlockAll("target invalid: "..invalidName)
+        Notify("🔓 Lost: "..invalidName)
         return
     end
 
@@ -549,11 +464,10 @@ end)
 --  CLEANUP
 -- ════════════════════════════════════════════════════════════
 Players.PlayerRemoving:Connect(function(p)
+    -- v4.2: player left = unlock doang, NO auto switch
     if State.CurrentTarget == p then
-        UnlockAll("player left")
-        -- player left = switch masih boleh
-        GetBestTarget(true)
-        if #State.Candidates > 0 then LockOn(State.Candidates[1].p, "auto switch") end
+        UnlockAll("player left: "..p.Name)
+        Notify("🔓 "..p.Name.." left")
     end
 end)
 
@@ -570,9 +484,5 @@ end)
 --  INIT
 -- ════════════════════════════════════════════════════════════
 EnsureCamera()
-Notify(string.format(
-    "✅ v4.2 | Lock %ds | NoAutoSwitch | Parry±%d° | RCtrl=Toggle RShift=Switch",
-    CFG.LOCK_DURATION,
-    CFG.PARRY_FRONT_ANGLE / 2
-), 5)
+Notify(string.format("✅ v4.2 | Lock %ds | RCtrl=Toggle RShift=Switch", CFG.LOCK_DURATION), 4)
 Log("v4.2 loaded | Duration:", CFG.LOCK_DURATION, "| Range:", CFG.AIM_RANGE)
