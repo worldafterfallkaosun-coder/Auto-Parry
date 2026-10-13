@@ -1036,24 +1036,17 @@ if ParryFX then
     end)
 end
 
-local AS = {
-    Target     = nil,
-    ExpireTime = 0,
-    InCombat   = false,
-    PrevPos    = nil,
-    Vel        = Vector3.zero,
-    LastVelT   = 0,
-    AlignOri   = nil,
-    Att0       = nil,
-    Candidates = {},
-    IsAtk      = false,
-    LastProx   = 0,
-    LastSwitch = 0,
-}
-
-local function IsBlocked()
+-- ============================================================
+--  SMART LOCK — v14 architecture, adapted for HSA
+--
+--  From v14: ProxCheck (auto-engage on own attacks), velocity
+--  prediction (UpdateVel + Predict), LockOn/UnlockAll/SwitchNext,
+--  SwitchOnHit (re-acquire on damage), candidate list.
+--  Gate kept from v6: lock runs only when inCombat == true.
+-- ============================================================
+local function LockBlocked()
     local c = LP.Character; if not c then return true end
-    for _,s in ipairs(ACFG.BlockedStates) do
+    for _, s in ipairs(LockCFG.BlockedStates) do
         if c:GetAttribute(s) == true then return true end
     end
     return false
@@ -1065,192 +1058,290 @@ local function ValidTarget(t)
     local h = c:FindFirstChild("Humanoid")
     if not h or h.Health <= 0 then return false end
     local r = c:FindFirstChild("HumanoidRootPart"); if not r then return false end
-    local myR = MyChar.root; if not myR then return false end
-    return Dist(myR, r) <= ACFG.LeashRange
+    return MC.root and Dist(MC.root, r) <= LockCFG.LeashRange
 end
-
-local function RefreshLock() AS.ExpireTime = os.clock() + ACFG.LockDuration end
 
 local function DestroyConstraint()
     pcall(function()
-        if AS.AlignOri then AS.AlignOri:Destroy(); AS.AlignOri=nil end
-        if AS.Att0     then AS.Att0:Destroy();     AS.Att0=nil     end
+        if Lock.alignOri then Lock.alignOri:Destroy(); Lock.alignOri = nil end
+        if Lock.att0     then Lock.att0:Destroy();     Lock.att0     = nil end
     end)
 end
 
 local function SetupConstraint()
-    local root = MyChar.root; if not root then return end
-    -- skip rebuild if constraint is already parented to current root
-    if AS.AlignOri and AS.AlignOri.Parent == root then return end
+    local root = MC.root; if not root then return end
+    if Lock.alignOri and Lock.alignOri.Parent == root then return end
     DestroyConstraint()
-    local att  = Instance.new("Attachment")
-    att.Name   = "_AA_A0"; att.Parent = root; AS.Att0 = att
-    local ao   = Instance.new("AlignOrientation")
-    ao.Name    = "_AA_AO"
-    ao.Mode    = Enum.OrientationAlignmentMode.OneAttachment
+    local att = Instance.new("Attachment")
+    att.Name = ATT_NAME; att.Parent = root; Lock.att0 = att
+    local ao = Instance.new("AlignOrientation")
+    ao.Name               = AO_NAME
+    ao.Mode               = Enum.OrientationAlignmentMode.OneAttachment
     ao.Attachment0        = att
-    ao.MaxTorque          = ACFG.MaxTorque
+    ao.MaxTorque          = LockCFG.MaxTorque
     ao.MaxAngularVelocity = math.huge
-    ao.Responsiveness     = ACFG.Responsiveness
+    ao.Responsiveness     = LockCFG.Responsiveness
     ao.RigidityEnabled    = false
     ao.PrimaryAxisOnly    = false
-    ao.Parent = root; AS.AlignOri = ao
+    ao.Parent             = root
+    Lock.alignOri         = ao
+end
+
+-- Velocity smoothing (v14: lerp toward raw vel each frame)
+local function UpdateVel(pos)
+    local now = os.clock()
+    local dt  = now - Lock.lastVelT
+    if Lock.prevPos and dt > 0 and dt < 0.3 then
+        local rawVel = (pos - Lock.prevPos) / dt
+        -- higher ping = smoother lerp to cut jitter
+        local alpha = math.clamp(0.35 - (Ping:get() - 80) / 2000, 0.12, 0.50)
+        Lock.vel = Lock.vel:Lerp(rawVel, alpha)
+    end
+    Lock.prevPos  = pos
+    Lock.lastVelT = now
+end
+
+-- Simple velocity prediction (v14): project by PredictFactor seconds
+local function Predict(pos, dt)
+    -- strip vertical component so prediction doesn't fly over heads
+    local hv = Vector3.new(Lock.vel.X, Lock.vel.Y * 0.15, Lock.vel.Z)
+    return pos + hv * (LockCFG.PredictFactor + dt * 0.5)
 end
 
 local function SetAimDir(pos)
-    if not AS.AlignOri or IsBlocked() then return end
-    local root = MyChar.root; if not root then return end
-    local dir  = pos - root.Position
-    -- retain 10% Y so aim stays stable on sloped terrain
-    dir = Vector3.new(dir.X, dir.Y * 0.1, dir.Z)
+    if not Lock.alignOri or LockBlocked() then return end
+    local root = MC.root; if not root then return end
+    local dir = pos - root.Position
+    dir = Vector3.new(dir.X, dir.Y * 0.12, dir.Z)
     if dir.Magnitude < 0.05 then return end
     dir = dir.Unit
     local up    = Vector3.new(0, 1, 0)
     local right = dir:Cross(up)
     if right.Magnitude < 0.01 then return end
     right = right.Unit
-    AS.AlignOri.CFrame = CFrame.fromMatrix(Vector3.zero, right, right:Cross(dir).Unit)
+    Lock.alignOri.CFrame = CFrame.fromMatrix(Vector3.zero, right, right:Cross(dir).Unit)
 end
 
-local function UpdateVel(pos)
-    local now = os.clock(); local dt = now - AS.LastVelT
-    if AS.PrevPos and dt > 0 and dt < 0.3 then
-        AS.Vel = AS.Vel:Lerp((pos - AS.PrevPos)/dt, Ping:velLerp())
-    end
-    AS.PrevPos = pos; AS.LastVelT = now
-end
-
-local function Predict(pos, dt)
-    local hv = Vector3.new(AS.Vel.X, 0, AS.Vel.Z)
-    return pos + hv * ACFG.PredictFactor * dt
-end
-
-local LockOn, UnlockAll, SwitchNext
-
+-- GetBestTarget: score-based with distance tiebreak (v6 scoring + v14 range)
 local function GetBestTarget(rescan)
-    local root = MyChar.root; if not root then return nil end
-    if not rescan and AS.Target and ValidTarget(AS.Target) then return AS.Target end
-    AS.Candidates = {}
-    local best, bestD = nil, ACFG.Range
-    for _,p in pairs(Players:GetPlayers()) do
+    local root = MC.root; if not root then return nil end
+    if not rescan and Lock.target and ValidTarget(Lock.target) then
+        return Lock.target
+    end
+    Lock.candidates = {}
+    local best, bestEff = nil, -1
+    for _, p in pairs(Players:GetPlayers()) do
         if p ~= LP then
             local c = p.Character; if not c then continue end
             local r = c:FindFirstChild("HumanoidRootPart")
             local h = c:FindFirstChild("Humanoid")
             if not r or not h or h.Health <= 0 then continue end
             local d = Dist(root, r)
-            if d <= ACFG.Range then
-                table.insert(AS.Candidates, {p=p, dist=d})
-                if d < bestD then bestD=d; best=p end
+            if d <= LockCFG.Range then
+                table.insert(Lock.candidates, {p = p, dist = d})
+                local ps = GetPS(p.UserId)
+                local sc, _ = Score(p, ps)
+                local eff = sc - d * 0.20
+                if eff > bestEff then bestEff = eff; best = p end
             end
         end
     end
-    table.sort(AS.Candidates, function(a,b) return a.dist < b.dist end)
+    table.sort(Lock.candidates, function(a, b) return a.dist < b.dist end)
     return best
 end
 
+local function ShouldSwitch(newTarget)
+    if not Lock.target or not ValidTarget(Lock.target) then return true end
+    if newTarget == Lock.target then return false end
+    local curSc, _ = Score(Lock.target, GetPS(Lock.target.UserId))
+    local newSc, _ = Score(newTarget,   GetPS(newTarget.UserId))
+    return (newSc - curSc) > LOCK_SWITCH_HYSTERESIS
+end
+
+-- LockOn: set target, reset vel state, setup constraint (v14 pattern)
+local LockOn, UnlockAll, SwitchNext
+
 LockOn = function(t)
     if not t then return end
-    local isNew = (t ~= AS.Target)
-    AS.Target = t; AS.PrevPos = nil; AS.Vel = Vector3.zero
-    RefreshLock()
+    local isNew = (t ~= Lock.target)
+    Lock.target     = t
+    Lock.expireTime = os.clock() + LockCFG.LockDuration
+    Lock.prevPos    = nil
+    Lock.vel        = Vector3.zero
     if isNew then SetupConstraint() end
 end
 
 UnlockAll = function()
-    AS.Target = nil; AS.PrevPos = nil; AS.Vel = Vector3.zero
+    Lock.target  = nil
+    Lock.prevPos = nil
+    Lock.vel     = Vector3.zero
     DestroyConstraint()
 end
 
+-- SwitchNext: cycle through candidates (v14)
 SwitchNext = function()
-    if #AS.Candidates < 1 then
+    if #Lock.candidates < 1 then
         GetBestTarget(true)
-        if #AS.Candidates < 1 then return end
+        if #Lock.candidates < 1 then return end
     end
-    if not AS.Target then LockOn(AS.Candidates[1].p); return end
-    for i, c in ipairs(AS.Candidates) do
-        if c.p == AS.Target then
-            LockOn(AS.Candidates[i % #AS.Candidates + 1].p); return
+    if not Lock.target then LockOn(Lock.candidates[1].p); return end
+    for i, c in ipairs(Lock.candidates) do
+        if c.p == Lock.target then
+            LockOn(Lock.candidates[i % #Lock.candidates + 1].p); return
         end
     end
-    LockOn(AS.Candidates[1].p)
+    LockOn(Lock.candidates[1].p)
 end
 
-if HitConfirm then
-    HitConfirm.OnClientEvent:Connect(function(t)
-        if not ACFG.ON then return end
-        AS.InCombat = true
-        if t and typeof(t)=="Instance" and t:IsA("Player") and t ~= LP then
-            LockOn(t)
-        else
-            local b = GetBestTarget(true); if b then LockOn(b) end
-        end
-    end)
-end
-
+-- ============================================================
+--  PROXCHECK — auto-engage lock when we start hitting (v14)
+--  Polls own attack attrs; on rising edge, finds closest enemy.
+-- ============================================================
 local PROX_ATKS = {
-    "State_Attacking","IsAttacking","Attacking","SwingActive","M1","InAttack"
+    "IsPunching","IsHeavyPunching","IsHitRunning",
+    "IsKickCombo","IsFiring","IsStartingBattle",
 }
 
 local function ProxCheck()
-    if HitConfirm or not ACFG.ON then return end
+    if not Lock.on then return end
     local now = os.clock()
-    if now - AS.LastProx < 0.12 then return end
-    AS.LastProx = now
+    if now - Lock.lastProx < 0.10 then return end
+    Lock.lastProx = now
     local c = LP.Character; if not c then return end
     local isAtk = false
-    for _,a in ipairs(PROX_ATKS) do
-        if c:GetAttribute(a) == true then isAtk=true; break end
+    for _, a in ipairs(PROX_ATKS) do
+        if c:GetAttribute(a) == true then isAtk = true; break end
     end
-    if isAtk and not AS.IsAtk then
-        local root = MyChar.root; if not root then return end
-        local closest, cd = nil, ACFG.ProxRange
-        for _,p in pairs(Players:GetPlayers()) do
+    -- rising edge: we just started attacking
+    if isAtk and not Lock.isAtk then
+        local root = MC.root; if not root then Lock.isAtk = isAtk; return end
+        local closest, cd = nil, LockCFG.ProxRange
+        for _, p in pairs(Players:GetPlayers()) do
             if p ~= LP and p.Character then
                 local er = p.Character:FindFirstChild("HumanoidRootPart")
                 local eh = p.Character:FindFirstChild("Humanoid")
                 if er and eh and eh.Health > 0 then
                     local d = Dist(root, er)
-                    if d < cd then cd=d; closest=p end
+                    if d < cd then cd = d; closest = p end
                 end
             end
         end
-        if closest then AS.InCombat=true; LockOn(closest) end
+        if closest then
+            MarkCombat()
+            LockOn(closest)
+        end
     end
-    AS.IsAtk = isAtk
+    Lock.isAtk = isAtk
 end
 
-RunService.Heartbeat:Connect(function(dt)
-    if Camera.CameraType ~= Enum.CameraType.Custom then
-        Camera.CameraType = Enum.CameraType.Custom
+-- ============================================================
+--  SELF-HIT HOOKS — MarkCombat on damage, LockOn re-acquire
+-- ============================================================
+local function HookSelf(char)
+    if not char then return end
+    local hum = char:FindFirstChildWhichIsA("Humanoid")
+
+    for _, attr in ipairs(SELF_ATKS) do
+        pcall(function()
+            char:GetAttributeChangedSignal(attr):Connect(function()
+                if char:GetAttribute(attr) == true then
+                    MarkCombat()
+                    if Lock.on and (not Lock.target or not ValidTarget(Lock.target)) then
+                        local best = GetBestTarget(true)
+                        if best then LockOn(best) end
+                    end
+                end
+            end)
+        end)
     end
-    if not ACFG.ON then return end
+
+    if hum then
+        local prevHP = hum.Health
+        hum:GetPropertyChangedSignal("Health"):Connect(function()
+            if hum.Health < prevHP then
+                MarkCombat()
+                if Lock.on then
+                    -- SwitchOnHit: on damage, re-acquire closest enemy (v14)
+                    local now = os.clock()
+                    if now - Lock.lastSwitch >= LockCFG.SwitchCooldown then
+                        Lock.lastSwitch = now
+                        local root = MC.root
+                        local closest, cd = nil, LockCFG.Range
+                        for _, p in pairs(Players:GetPlayers()) do
+                            if p ~= LP and p.Character then
+                                local er = p.Character:FindFirstChild("HumanoidRootPart")
+                                local eh = p.Character:FindFirstChild("Humanoid")
+                                if er and eh and eh.Health > 0 then
+                                    local d = root and Dist(root, er) or 9999
+                                    if d < cd then cd = d; closest = p end
+                                end
+                            end
+                        end
+                        if closest then LockOn(closest)
+                        elseif not Lock.target then
+                            local b = GetBestTarget(true); if b then LockOn(b) end
+                        end
+                    end
+                end
+            end
+            prevHP = hum.Health
+        end)
+    end
+end
+
+LP.CharacterAdded:Connect(function(c) task.wait(0.25); HookSelf(c) end)
+if LP.Character then HookSelf(LP.Character) end
+
+-- ============================================================
+--  LOCK HEARTBEAT — body-only lock, default Roblox camera
+--
+--  AlignOrientation rotates avatar body toward target.
+--  Camera dibiarkan default Roblox (Custom), TIDAK disentuh.
+--  Lock hanya aktif saat inCombat == true (hit/kena hit).
+-- ============================================================
+RunService.Heartbeat:Connect(function(dt)
+    -- Jangan paksa CameraType — biarkan Roblox handle sendiri
+
+    CheckNeutral()
     ProxCheck()
-    if AS.Target and os.clock() > AS.ExpireTime then UnlockAll(); return end
-    if AS.Target and not ValidTarget(AS.Target) then UnlockAll(); return end
-    if not AS.Target then return end
-    local ec = AS.Target.Character; if not ec then return end
+
+    -- gate: hanya jalan waktu combat aktif DAN lock on
+    local active = Lock.on and Lock.inCombat
+    if not active then
+        if Lock.target and not Lock.inCombat then
+            UnlockAll()
+        end
+        return
+    end
+
+    if Lock.target and os.clock() > Lock.expireTime then
+        UnlockAll(); return
+    end
+    if Lock.target and not ValidTarget(Lock.target) then
+        UnlockAll(); return
+    end
+
+    -- periodic rescan dengan hysteresis
+    local best = GetBestTarget(true)
+    if best and ShouldSwitch(best) then LockOn(best) end
+    if not Lock.target and best then LockOn(best); return end
+    if not Lock.target then return end
+
+    local ec = Lock.target.Character; if not ec then return end
     local er = ec:FindFirstChild("HumanoidRootPart"); if not er then return end
+
+    -- velocity update + prediction
     UpdateVel(er.Position)
-    SetAimDir(Predict(er.Position, dt))
+    local aimPt = Predict(er.Position, dt)
+    aimPt = Vector3.new(aimPt.X, aimPt.Y + 1.5, aimPt.Z)
+
+    -- hanya body yang rotate, kamera TIDAK disentuh sama sekali
+    SetAimDir(aimPt)
 end)
 
 Players.PlayerRemoving:Connect(function(p)
-    if AS.Target == p then UnlockAll() end
+    if Lock.target == p then UnlockAll() end
 end)
-
-LP.CharacterAdded:Connect(function()
-    UnlockAll(); AS.InCombat=false; AS.IsAtk=false
-    task.wait(0.5); SetupConstraint()
-end)
-
-UIS.InputBegan:Connect(function(i, g)
-    if g then return end
-    if i.KeyCode == ACFG.SwitchKey and ACFG.ON then
-        GetBestTarget(true); SwitchNext()
-    end
-end)
-
 
 -- ============================================================
 --  RESPAWN CLEANUP
